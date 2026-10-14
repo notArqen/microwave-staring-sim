@@ -2,6 +2,8 @@
 
 A browser game about staring at a microwave and deciding when to open the door. Solo, or online with 2-4 players (peer-to-peer).
 
+**Also here:** [Sump Clerk](sump-clerk/), a one-room night-shift horror game about keeping three needles in the green until 06:00. Play it at [/sump-clerk/](https://notarqen.github.io/microwave-staring-sim/sump-clerk/).
+
 Open `index.html` in a browser, or play it on GitHub Pages. `I` on the menu shows the rules, `S` opens settings, `Esc` goes back to the menu from anywhere.
 
 **Solo:** the timer is a random 0:15 to 3:00 each run. Turn that off in **Settings** to pick your own (`1`-`6` or the arrow keys).
