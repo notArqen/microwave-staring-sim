@@ -1499,7 +1499,8 @@ function leaveToMenu(){               // back to the main menu (a reload: clean 
   if(phase!=='live'){ location.reload(); return; }              // still in the intro: nothing to dissolve
   if(phase==='leaving') return;
   phase='leaving'; leaving=true; leavingAt=performance.now();
-  menuSfx();                                                      // the same bitcrushed drop as pressing play
+  if(ac && masterIn){ masterIn.gain.cancelScheduledValues(ac.currentTime); masterIn.gain.setValueAtTime(0, ac.currentTime); }   // music, room tone, everything cuts the instant the leave sound starts
+  useDry=true; try{ menuSfx(); } finally{ useDry=false; }          // the same bitcrushed drop as pressing play, on the dry route so it isn't muted
   setTimeout(()=>{ try{ if(ac) ac.suspend(); }catch(e){} }, 1450);   // everything goes silent once it's black
   setTimeout(()=>location.reload(), 2700);                         // ...then the menu pops up
 }
@@ -1751,8 +1752,8 @@ function frame(now){
   if(buzzGain) buzzGain.gain.value = .008 + .03*flEff + (flEff<.5 ? .02 : 0);
 
   if(ui.pre){ const sec=Math.max(0, Math.ceil((ui.pre.until-now)/1000)); if(sec!==ui.preSecs) ui.preSecs=sec; if(sec===0 && now>ui.pre.until+500) ui.pre=null; }
-  { const a=(now-alarmStartAt)/1000, target = (state==='done' && !death) ? (a<4 ? a/4 : 1+Math.min(1,(a-4)/22)) : 0;    // black edges by 4 s, then a pinhole
-    dist += (target-dist)*Math.min(1, dt*(target>dist ? 1.2 : 3)); postMat.uniforms.vig.value = dist; }
+  { const a=(now-alarmStartAt)/1000, target = (state==='done' && !death) ? (a<.6 ? .35+.65*(a/.6) : 1+Math.min(1,(a-.6)/10)) : 0;    // it hits at once (35% the instant it rings), full black edges by 0.6 s, then a pinhole over ~10 s
+    dist += (target-dist)*Math.min(1, dt*(target>dist ? 12 : 3)); postMat.uniforms.vig.value = dist; }
   deathTick(now);
   typeTick(now);
   beatTick(now, dt);
