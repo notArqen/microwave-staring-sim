@@ -593,14 +593,21 @@ function drawDisplay(txt, on, mw=mws[me]){
 
 /* ---------- audio ---------- */
 let ac=null, hum=null, humGain=null, drone=null;
+/* every normal sound plays through masterIn -> masterLP -> speakers, so the death scene can mute the game and then
+   bring it back through a slowly opening low-pass. death-scene sounds use the dry route straight to the speakers. */
+let AOUT=null, ADRY=null, masterIn=null, masterLP=null, useDry=false;
+const DEST = () => useDry ? ADRY : AOUT;
 function audioInit(){
   if(ac) return;
   try {
     ac = new (window.AudioContext||window.webkitAudioContext)();
+    ADRY = ac.destination; masterIn = ac.createGain(); masterLP = ac.createBiquadFilter();
+    masterLP.type='lowpass'; masterLP.frequency.value=22000; masterLP.Q.value=.6;
+    masterIn.connect(masterLP); masterLP.connect(ADRY); AOUT = masterIn;
     preloadSfx();
     hum = ac.createOscillator(); hum.type='sawtooth'; hum.frequency.value=120;
     const hl = ac.createBiquadFilter(); hl.type='lowpass'; hl.frequency.value=380;
-    humGain = ac.createGain(); humGain.gain.value=0; hum.connect(hl).connect(humGain).connect(ac.destination); hum.start();
+    humGain = ac.createGain(); humGain.gain.value=0; hum.connect(hl).connect(humGain).connect(DEST()); hum.start();
   } catch(e){ ac=null; }
 }
 /* loads sfx/<name>.(mp3|ogg|wav) and loops it; resolves false if no file exists */
@@ -610,7 +617,7 @@ async function loadLoop(name, vol){
       const r = await fetch(`sfx/${name}.${ext}`); if(!r.ok) continue;
       const buf = await ac.decodeAudioData(await r.arrayBuffer());
       const s = ac.createBufferSource(); s.buffer=buf; s.loop=true;
-      const g = ac.createGain(); g.gain.value=vol; s.connect(g).connect(ac.destination); s.start();
+      const g = ac.createGain(); g.gain.value=vol; s.connect(g).connect(DEST()); s.start();
       return true;
     } catch(e){}
   }
@@ -620,7 +627,7 @@ async function loadLoop(name, vol){
 let menuAmb=null;
 function menuAmbStart(){
   if(!ac || menuAmb || phase!=='menu' || ac.state!=='running') return;
-  const out=ac.createGain(); out.gain.value=0; out.gain.linearRampToValueAtTime(1,ac.currentTime+2.5); out.connect(ac.destination);
+  const out=ac.createGain(); out.gain.value=0; out.gain.linearRampToValueAtTime(1,ac.currentTime+2.5); out.connect(DEST());
   const o=ac.createOscillator(); o.type='sine'; o.frequency.value=46;
   const og=ac.createGain(); og.gain.value=.16; o.connect(og).connect(out); o.start();
   const lfo=ac.createOscillator(), lg=ac.createGain(); lfo.frequency.value=.11; lg.gain.value=.07; lfo.connect(lg).connect(og.gain); lfo.start();
@@ -651,14 +658,14 @@ async function preloadSfx(){
 function sfx(name, vol=1, fallback){
   if(ac && sfxBuf[name]){
     const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=sfxBuf[name]; g.gain.value=vol;
-    s.connect(g).connect(ac.destination); s.start(); return true;
+    s.connect(g).connect(DEST()); s.start(); return true;
   }
   if(fallback) fallback(); return false;
 }
 function loopStart(name, vol=1){
   if(!ac || !sfxBuf[name]) return null;
   const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=sfxBuf[name]; s.loop=true; g.gain.value=vol;
-  s.connect(g).connect(ac.destination); s.start(); return {s,g};
+  s.connect(g).connect(DEST()); s.start(); return {s,g};
 }
 function loopStop(h){ if(!h) return; h.g.gain.setTargetAtTime(0, ac.currentTime, .05); h.s.stop(ac.currentTime+.4); }
 
@@ -669,8 +676,8 @@ function humStart(vol=.8, pan=0){
   const b = sfxBuf.mw_hum; if(!ac || !b) return null;
   const L=b.duration, seg=Math.min(L*.6,4), xf=Math.min(.6,seg/3), t0=ac.currentTime+.01;
   const master=ac.createGain(); master.gain.value=vol;
-  if(pan && ac.createStereoPanner){ const p=ac.createStereoPanner(); p.pan.value=pan; master.connect(p); p.connect(ac.destination); }   // other players' microwaves sit left/right of you
-  else master.connect(ac.destination);
+  if(pan && ac.createStereoPanner){ const p=ac.createStereoPanner(); p.pan.value=pan; master.connect(p); p.connect(DEST()); }   // other players' microwaves sit left/right of you
+  else master.connect(DEST());
   const copy=(offset,len,at,fadeIn)=>{
     const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=b;
     g.gain.setValueAtTime(fadeIn?0:1,at); if(fadeIn) g.gain.linearRampToValueAtTime(1,at+xf);
@@ -691,7 +698,7 @@ function humStop(h){
 /* the alarm is its own clip so it can be cut off the instant you open the door */
 function playAlarm(level=1){
   if(!ac) return; const b=sfxBuf.mw_alarm||sfxBuf.mw_end; if(!b) return;
-  stopAlarm(); const s=ac.createBufferSource(), g=ac.createGain(); g.gain.value=level; s.buffer=b; s.connect(g).connect(ac.destination); s.start(); alarmSrc={s,g};
+  stopAlarm(); const s=ac.createBufferSource(), g=ac.createGain(); g.gain.value=level; s.buffer=b; s.connect(g).connect(DEST()); s.start(); alarmSrc={s,g};
 }
 function stopAlarm(){
   if(!alarmSrc) return; const {s,g}=alarmSrc; alarmSrc=null;
@@ -700,7 +707,7 @@ function stopAlarm(){
 function playAlarmAt(vol, pan){            // another player's alarm: quieter, off to one side
   if(!ac) return false; const b=sfxBuf.mw_alarm||sfxBuf.mw_end; if(!b) return false;
   const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=b; g.gain.value=vol; s.connect(g);
-  if(pan && ac.createStereoPanner){ const p=ac.createStereoPanner(); p.pan.value=pan; g.connect(p); p.connect(ac.destination); } else g.connect(ac.destination);
+  if(pan && ac.createStereoPanner){ const p=ac.createStereoPanner(); p.pan.value=pan; g.connect(p); p.connect(DEST()); } else g.connect(DEST());
   s.start(); return true;
 }
 function stopRemote(mw){ if(mw.hum){ humStop(mw.hum); mw.hum=null; } }
@@ -716,20 +723,20 @@ async function startAmbient(){
   let last=0; for(let i=0;i<len;i++){ last=(last+.02*(Math.random()*2-1))/1.02; d[i]=last*3.5; }
   const n = ac.createBufferSource(); n.buffer=buf; n.loop=true;
   const lp = ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=140;
-  drone = ac.createGain(); drone.gain.value=.5; n.connect(lp).connect(drone).connect(ac.destination); n.start();
+  drone = ac.createGain(); drone.gain.value=.5; n.connect(lp).connect(drone).connect(DEST()); n.start();
 }
 function beep(f=2300,dur=.16,vol=.12){
   if(!ac) return;
   const o=ac.createOscillator(), g=ac.createGain(); o.type='square'; o.frequency.value=f;
   g.gain.setValueAtTime(vol,ac.currentTime); g.gain.setValueAtTime(0,ac.currentTime+dur);
-  o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime+dur+.02);
+  o.connect(g).connect(DEST()); o.start(); o.stop(ac.currentTime+dur+.02);
 }
 function thunk(f=90,dur=.12,vol=.35){
   if(!ac) return;
   const o=ac.createOscillator(), g=ac.createGain(); o.type='triangle';
   o.frequency.setValueAtTime(f,ac.currentTime); o.frequency.exponentialRampToValueAtTime(f*.5,ac.currentTime+dur);
   g.gain.setValueAtTime(vol,ac.currentTime); g.gain.exponentialRampToValueAtTime(.001,ac.currentTime+dur);
-  o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime+dur+.02);
+  o.connect(g).connect(DEST()); o.start(); o.stop(ac.currentTime+dur+.02);
 }
 
 /* type sounds: short hand-rendered clicks, crushed (sample-and-hold + few levels) and dark.
@@ -757,7 +764,7 @@ function typeSfx(kind, vol=.5){
   if(!ac || ac.state!=='running' || !TYPE_CFG[kind]) return;
   const list = typeBufs[kind] || (typeBufs[kind] = [0,1,2,3].map(v=>makeTypeBuf(kind,v)));
   const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=list[(Math.random()*list.length)|0];
-  s.playbackRate.value=.96+Math.random()*.08; g.gain.value=vol; s.connect(g).connect(ac.destination); s.start();
+  s.playbackRate.value=.96+Math.random()*.08; g.gain.value=vol; s.connect(g).connect(DEST()); s.start();
 }
 /* typewriter for the response lines: characters appear one by one with a dark tick; pauses at line ends and full stops */
 let typing=null, msgDoneAt=0, pendingRend=null;
@@ -781,13 +788,24 @@ function deathTick(now){
   postMat.uniforms.expo.value=expo; postMat.uniforms.dflash.value=fl;
 }
 function deathSfx(){
-  if(!ac) return; const t=ac.currentTime;
+  if(!ac) return; const t=ac.currentTime, tf=t+4.0;
+  /* the game's own sound (music, room tone, buzz, hum, alarm) goes silent the instant the door opens... */
+  masterIn.gain.cancelScheduledValues(t); masterIn.gain.setValueAtTime(0,t);
+  masterLP.frequency.cancelScheduledValues(t); masterLP.frequency.setValueAtTime(160,t);
+  /* ...and returns at the white flash, muffled, as the low-pass slowly opens back to the original sound */
+  masterIn.gain.setValueAtTime(0,tf); masterIn.gain.linearRampToValueAtTime(1,tf+.04);
+  masterLP.frequency.setValueAtTime(160,tf); masterLP.frequency.exponentialRampToValueAtTime(22000,tf+8);
+  useDry=true;                                                   // the death scene's own sounds bypass the master
+  try { deathSounds(t); } finally { useDry=false; }
+}
+function deathSounds(t){
+  if(!ac) return;
   menuSfx();                                                                           // lights out: the same bitcrushed drop as starting a game
   const mk=(type,f0,f1,t0,t1,v0,v1)=>{ const o=ac.createOscillator(), g=ac.createGain(); o.type=type;
     o.frequency.setValueAtTime(f0,t+t0); o.frequency.exponentialRampToValueAtTime(f1,t+t1);
     g.gain.setValueAtTime(0.0001,t+t0); g.gain.linearRampToValueAtTime(v0,t+t0+.25); g.gain.linearRampToValueAtTime(v1,t+t1);
     g.gain.setValueAtTime(v1,t+t1); g.gain.linearRampToValueAtTime(0.0001,t+t1+.05);
-    o.connect(g).connect(ac.destination); o.start(t+t0); o.stop(t+t1+.1); return {o,g}; };
+    o.connect(g).connect(DEST()); o.start(t+t0); o.stop(t+t1+.1); return {o,g}; };
   mk('sine',1000,1000,.3,4.0,.09,.09);                                                 // the flatline
   const wh=mk('sine',260,2600,.6,3.95,.02,.17);                                        // the defibrillator charging
   const lfo=ac.createOscillator(), lg=ac.createGain(); lfo.frequency.value=13; lg.gain.value=.05; lfo.connect(lg).connect(wh.g.gain); lfo.start(t+.6); lfo.stop(t+4.0);
@@ -822,12 +840,12 @@ function noiseBurst(t, len, type, freq, q, vol, sweepTo){
   const n=ac.createBufferSource(); n.buffer=noiseBuf; const f=ac.createBiquadFilter(); f.type=type; f.frequency.setValueAtTime(freq,t); f.Q.value=q;
   if(sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo,t+len);
   const g=ac.createGain(); g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(vol,t+.002); g.gain.exponentialRampToValueAtTime(.0005,t+len);
-  n.connect(f).connect(g).connect(ac.destination); n.start(t,Math.random()*.5); n.stop(t+len+.02);
+  n.connect(f).connect(g).connect(DEST()); n.start(t,Math.random()*.5); n.stop(t+len+.02);
 }
 function tone(t, f0, f1, len, vol, type='triangle'){
   if(!ac) return; const o=ac.createOscillator(), g=ac.createGain(); o.type=type;
   o.frequency.setValueAtTime(f0,t); o.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+len);
-  g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(.0005,t+len); o.connect(g).connect(ac.destination); o.start(t); o.stop(t+len+.02);
+  g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(.0005,t+len); o.connect(g).connect(DEST()); o.start(t); o.stop(t+len+.02);
 }
 function doorOpenSynth(vol=1){
   if(!ac) return; const t=ac.currentTime;
@@ -867,7 +885,7 @@ function menuSfx(){
     d[i]=hold;
   }
   const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=buf; g.gain.value=.8;
-  s.connect(g).connect(ac.destination); s.start();
+  s.connect(g).connect(DEST()); s.start();
 }
 
 /* light buzz: follows the flicker */
@@ -880,7 +898,7 @@ function startBuzz(){
     const o=ac.createOscillator(); o.type=i?'square':'sawtooth'; o.frequency.value=f+(i?Math.random()*.6:0);
     const og=ac.createGain(); og.gain.value=[1,.35,.18][i]; o.connect(og).connect(lp); o.start();
   });
-  lp.connect(buzzGain).connect(ac.destination);
+  lp.connect(buzzGain).connect(DEST());
 }
 
 /* music: tries music/track.(mp3|ogg|wav), falls back to a synth techno loop */
@@ -931,7 +949,7 @@ function playMusicBuffer(buf){
   const room=makeRoom(ac,.55,.6);
   const bus=ac.createGain();                                        // every copy of the track plays into this
   bus.connect(lo); mkAnalyser(lo);                                  // fallback beat detection hears it before the reverb smears it
-  lo.connect(room.input); room.output.connect(lp).connect(g).connect(ac.destination);
+  lo.connect(room.input); room.output.connect(lp).connect(g).connect(DEST());
 
   /* seamless loop: ~4 s before the end the start fades in under the tail (equal-power), and so on forever */
   const D=buf.duration, xf=Math.min(4, D/3), step=D-xf, N=48;
@@ -1021,7 +1039,7 @@ function buildTechno(ctx, dest){
   return { step, step16, tap:out };
 }
 function synthTechno(){
-  const T = buildTechno(ac, ac.destination); mkAnalyser(T.tap); beatSource='synth';
+  const T = buildTechno(ac, DEST()); mkAnalyser(T.tap); beatSource='synth';
   let i=0, next=ac.currentTime+.1;
   setInterval(()=>{ while(next<ac.currentTime+.2){ T.step16(i,next); i++; next+=T.step; } },30);
 }
@@ -1031,7 +1049,7 @@ function legacySynth(){
   const bpm=122, step=60/bpm/4;
   const master=ac.createGain(); master.gain.value=.55;
   const mlp=ac.createBiquadFilter(); mlp.type='lowpass'; mlp.frequency.value=3200;
-  master.connect(mlp).connect(ac.destination); mkAnalyser(mlp); beatSource='synth';
+  master.connect(mlp).connect(DEST()); mkAnalyser(mlp); beatSource='synth';
   const nb=ac.createBuffer(1,ac.sampleRate,ac.sampleRate), nd=nb.getChannelData(0);
   for(let i=0;i<nd.length;i++) nd[i]=Math.random()*2-1;
   /* pad */
