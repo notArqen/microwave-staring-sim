@@ -31,12 +31,12 @@ const post = new THREE.Scene();
 const postCam = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
 const postMat = new THREE.ShaderMaterial({
   uniforms:{ t:{value:rt.texture}, res:{value:new THREE.Vector2(320,RTH)}, time:{value:0}, boost:{value:1.9},
-    hud:{value:null}, menu:{value:null}, mA:{value:1}, blk:{value:1} },
+    hud:{value:null}, menu:{value:null}, mA:{value:1}, blk:{value:1}, expo:{value:1}, dflash:{value:0}, vig:{value:0} },
   vertexShader:`varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }`,
   fragmentShader:`
     precision highp float;
     uniform sampler2D t; uniform sampler2D hud; uniform sampler2D menu;
-    uniform vec2 res; uniform float time; uniform float boost; uniform float mA; uniform float blk;
+    uniform vec2 res; uniform float time; uniform float boost; uniform float mA; uniform float blk; uniform float expo; uniform float dflash; uniform float vig;
     varying vec2 vUv;
     float b2(vec2 a){ a=floor(a); return fract(a.x/2.+a.y*a.y*.75); }
     float b4(vec2 a){ return b2(.5*a)*.25+b2(a); }
@@ -52,7 +52,7 @@ const postMat = new THREE.ShaderMaterial({
     void main(){
       vec2 px = floor(vUv*res);
       vec2 uv = (px+.5)/res;
-      vec3 c = texture2D(t,uv).rgb * boost;
+      vec3 c = texture2D(t,uv).rgb * boost * expo;                       // expo: 0 = black, >1 = blown out (resuscitation)
       /* text and menu live in the same low-res pipeline, so they get the same dither + palette */
       vec4 hu = texture2D(hud,uv); c = mix(c, hu.rgb, hu.a);
       if(blk>.5) c = vec3(0.);
@@ -77,11 +77,14 @@ const postMat = new THREE.ShaderMaterial({
       }
       /* second posterize pass, per channel */
       o = floor(o*7.+.5)/7.;
+      o = mix(o, vec3(.93,.90,.82), clamp(dflash,0.,1.));                  // the shock: a white-out
       /* grain + vignette */
       float g = h(px+floor(time*12.))-.5;
       o += g*.045;
       vec2 q = vUv-.5;
       o *= 1.-dot(q,q)*1.35;
+      float rr = length(q)*(1.+.12*sin(time*5.5))*(1.+max(vig-1.,0.)*1.7);   // vig 0..1: edges go black; 1..2: the opening shrinks to a pinhole
+      o *= 1. - min(vig,1.)*smoothstep(.10,.55, rr);
       gl_FragColor = vec4(o,1.);
     }`
 });
@@ -92,11 +95,11 @@ const mkLayer = () => { const c=document.createElement('canvas'); const tx=new T
   tx.minFilter=tx.magFilter=THREE.NearestFilter; tx.generateMipmaps=false; return {c, g:c.getContext('2d'), tx}; };
 const hudL = mkLayer(), menuL = mkLayer();
 postMat.uniforms.hud.value = hudL.tx; postMat.uniforms.menu.value = menuL.tx;
-const ui = { prompt:'', stat:'', msg:'', board:null, toast:'' };
+const ui = { prompt:'', stat:'', msg:'', board:null, toast:'', reveal:-1, pre:null, preSecs:0, hidden:false };   // reveal: characters of msg shown so far (-1 = all)
 const FONT = 'ui-monospace,"Courier New",monospace';
 
 /* draws a block of lines on a dark plate; shrinks the font until it fits */
-function textBlock(g, lines, x, y, size, color, align, rw, plate=true){
+function textBlock(g, lines, x, y, size, color, align, rw, plate=true, reveal=-1){
   let s = size, widest = 0;
   const setF = () => { g.font = `bold ${s}px ${FONT}`; try{ g.letterSpacing = Math.max(0,Math.round(s/8))+'px'; }catch(e){} };
   setF(); const meas = () => Math.max(...lines.map(l=>g.measureText(l).width));
@@ -109,8 +112,11 @@ function textBlock(g, lines, x, y, size, color, align, rw, plate=true){
   g.textBaseline='top'; g.textAlign='left';
   lines.forEach((l,i)=>{
     const ly = y + i*lh, lx = align==='center' ? Math.round(x - g.measureText(l).width/2) : left;
-    g.fillStyle='#000'; g.fillText(l,lx+1,ly+1);
-    g.fillStyle=color; g.fillText(l,lx,ly);
+    let shown = l;                                                  // typewriter: draw only the first `reveal` characters, in place
+    if(reveal>=0){ const before = lines.slice(0,i).reduce((a,t)=>a+t.length,0); shown = l.slice(0, Math.max(0, reveal-before)); }
+    if(!shown) return;
+    g.fillStyle='#000'; g.fillText(shown,lx+1,ly+1);
+    g.fillStyle=color; g.fillText(shown,lx,ly);
   });
   return s;
 }
@@ -126,7 +132,7 @@ const COLS = [
 let mp = null;                        // null = solo, otherwise { n, me } for an online match
 let menuView = 'main', joinCode = '', menuHover = -1, netStatus = '';
 const net = { role:null, peer:null, conns:[], hostConn:null, pid:null, code:'', players:[], lobby:[], order:[],
-  round:0, rounds:5, resolved:{}, rpts:{}, tot:{}, started:false, dead:false, roundTimer:null, nextId:0 };
+  round:0, rounds:5, resolved:{}, rpts:{}, tot:{}, gone:{}, shown:{}, scheduled:false, started:false, dead:false, roundTimer:null, nextId:0 };
 const MENU_ITEMS = [['p','SOLO'],['h','HOST A ROOM'],['j','JOIN A ROOM'],['i','HOW TO PLAY'],['s','SETTINGS']];
 const menuRowY = i => RTH*.46 + i*19;
 const menuRowAt = y => { const i = Math.round((y-RTH*.46)/19); return (i>=0 && i<MENU_ITEMS.length && Math.abs(y-menuRowY(i))<10) ? i : -1; };
@@ -134,27 +140,40 @@ const menuRowAt = y => { const i = Math.round((y-RTH*.46)/19); return (i>=0 && i
 let musicMode = (()=>{ try{ return localStorage.getItem('mw-music-mode')==='legacy' ? 'legacy' : 'new'; }catch(e){ return 'new'; } })();   // which built-in synth
 let randomTime = (()=>{ try{ return localStorage.getItem('mw-random-time')!=='off'; }catch(e){ return true; } })();   // solo: random 15s-3min unless switched off
 let customInfo = null, settingsMsg = '';              // customInfo: { name, bpm } once a track is saved
-const SETTINGS_ROWS = [['u',.34],['c',.43],['l',.52],['t',.61],['escape',.91]];
+const SETTINGS_ROWS = [['u',.29],['c',.37],['l',.45],['t',.53],['d',.61],['escape',.92]];
 const settingsRowAt = y => { for(const [k,f] of SETTINGS_ROWS) if(Math.abs(y-RTH*f)<10) return k; return null; };
 
 /* scoring: seconds away from the end -> points, linear between anchors. letting it end costs points. */
-const POINTS_CURVE = [[0,15],[.002,15],[.004,14],[.5,13],[10,3],[14,1],[20,0]];   // +15 only within the last 2ms
-const END_PENALTY = -5;
+/* seconds away from the end -> points (Normal). Harder modes shrink the distances (the same curve, squeezed) and cost more when it rings. */
+const POINTS_CURVE = [[0,15],[.002,15],[.015,13],[.06,10],[.2,7],[.5,5],[1,3],[2,2],[4,1],[8,0]];
+const DIFFS = [
+  { name:'EASY',   scale:2.2, pen:-3  },
+  { name:'NORMAL', scale:1,   pen:-5  },
+  { name:'HARD',   scale:.5,  pen:-8  },
+  { name:'BRUTAL', scale:.2,  pen:-12 },
+];
+let diffIdx = (()=>{ try{ const v=parseInt(localStorage.getItem('mw-diff'),10); return (v>=0 && v<DIFFS.length) ? v : 1; }catch(e){ return 1; } })();
+let END_PENALTY = DIFFS[diffIdx].pen;
+function setDiff(i, save=true){                                  // online matches use the host's, without touching your own saved choice
+  diffIdx = ((i%DIFFS.length)+DIFFS.length)%DIFFS.length; END_PENALTY = DIFFS[diffIdx].pen;
+  if(save){ try{ localStorage.setItem('mw-diff', String(diffIdx)); }catch(e){} }
+}
 function pointsFor(rem){
-  const c = POINTS_CURVE;
-  if(rem <= c[0][0]) return c[0][1];
-  for(let i=1;i<c.length;i++) if(rem <= c[i][0]){
+  const c = POINTS_CURVE, x = rem / DIFFS[diffIdx].scale;
+  if(x <= c[0][0]) return c[0][1];
+  for(let i=1;i<c.length;i++) if(x <= c[i][0]){
     const [x0,y0]=c[i-1], [x1,y1]=c[i];
-    return Math.round(y0 + (y1-y0)*(rem-x0)/(x1-x0));
+    return Math.round(y0 + (y1-y0)*(x-x0)/(x1-x0));
   }
   return 0;
 }
 function helpLines(){
   const row = (label,v) => label.padEnd(26) + ((v>0?'+':'')+v).padStart(4);
-  return ['HOW TO PLAY','',
+  const ms = Math.max(.4, 2*DIFFS[diffIdx].scale).toFixed(1);
+  return ['HOW TO PLAY  ('+DIFFS[diffIdx].name+')','',
     'A MICROWAVE COUNTS DOWN.','OPEN THE DOOR [E / SPACE / CLICK]','AS LATE AS YOU DARE.','',
-    row('LAST 0.002 SECONDS',pointsFor(0)), row('0.5 SECONDS AWAY',pointsFor(.5)), row('10 SECONDS AWAY',pointsFor(10)),
-    row('14 SECONDS AWAY',pointsFor(14)), row('20+ SECONDS AWAY',pointsFor(20)), row('LET IT END',END_PENALTY),'',
+    row('LAST '+ms+' MILLISECONDS',pointsFor(0)), row('0.5 SECONDS AWAY',pointsFor(.5)), row('1 SECOND AWAY',pointsFor(1)),
+    row('2 SECONDS AWAY',pointsFor(2)), row('4 SECONDS AWAY',pointsFor(4)), row('LET IT END',END_PENALTY),'',
     'ONLINE: 2-4 PLAYERS, 5 ROUNDS.','EVERYONE HAS A MICROWAVE AND A','DIFFERENT TIMER. YOURS HAS THE','GREEN SCREEN. MOST POINTS WINS.','','[ESC] BACK'];
 }
 
@@ -163,6 +182,7 @@ const dust = Array.from({length:44},()=>({x:Math.random(),y:Math.random(),vx:(Ma
 let glitch = 0;
 function drawMenu(rw, t){
   const g = menuL.g;
+  if(leaving){ g.fillStyle='#000'; g.fillRect(0,0,rw,RTH); menuL.tx.needsUpdate = true; return; }   // leaving the game: the dissolve covers it with black
   g.fillStyle='#050403'; g.fillRect(0,0,rw,RTH);
   const fk = fl;
   const gr = g.createRadialGradient(rw/2,RTH*.96,4,rw/2,RTH*.96,RTH*.75);
@@ -192,12 +212,13 @@ function drawMenu(rw, t){
     textBlock(g, helpLines(), cx, RTH*.16, 8, '#cdb98a', 'center', rw, false);
   } else if(menuView==='settings'){
     const cur = customInfo ? `${customInfo.name.length>26 ? customInfo.name.slice(0,25)+'~' : customInfo.name}  (${customInfo.bpm} BPM)` : 'BUILT-IN TRACK';
-    textBlock(g,['MUSIC'], cx, RTH*.19, 9, '#a08a60', 'center', rw, false);
-    textBlock(g,[cur.toUpperCase()], cx, RTH*.25, 9, '#cdb98a', 'center', rw, false);
-    textBlock(g,['[U] LOAD YOUR OWN TRACK'], cx, RTH*.34, 10, '#ffe14a', 'center', rw, false);
-    textBlock(g,[customInfo ? '[C] BACK TO THE BUILT-IN TRACK' : ' '], cx, RTH*.43, 10, '#ffe14a', 'center', rw, false);
-    textBlock(g,[`[L] BUILT-IN SYNTH: ${musicMode==='legacy' ? 'LEGACY' : 'NEW'}`], cx, RTH*.52, 10, '#ffe14a', 'center', rw, false);
-    textBlock(g,[`[T] SOLO TIMER: ${randomTime ? 'RANDOM 0:15-3:00' : 'YOUR CHOICE'}`], cx, RTH*.61, 10, '#ffe14a', 'center', rw, false);
+    textBlock(g,['MUSIC'], cx, RTH*.14, 9, '#a08a60', 'center', rw, false);
+    textBlock(g,[cur.toUpperCase()], cx, RTH*.20, 9, '#cdb98a', 'center', rw, false);
+    textBlock(g,['[U] LOAD YOUR OWN TRACK'], cx, RTH*.29, 10, '#ffe14a', 'center', rw, false);
+    textBlock(g,[customInfo ? '[C] BACK TO THE BUILT-IN TRACK' : ' '], cx, RTH*.37, 10, '#ffe14a', 'center', rw, false);
+    textBlock(g,[`[L] BUILT-IN SYNTH: ${musicMode==='legacy' ? 'LEGACY' : 'NEW'}`], cx, RTH*.45, 10, '#ffe14a', 'center', rw, false);
+    textBlock(g,[`[D] DIFFICULTY: ${DIFFS[diffIdx].name}`], cx, RTH*.61, 10, '#ffe14a', 'center', rw, false);
+    textBlock(g,[`[T] SOLO TIMER: ${randomTime ? 'RANDOM 0:15-3:00' : 'YOUR CHOICE'}`], cx, RTH*.53, 10, '#ffe14a', 'center', rw, false);
     textBlock(g,[settingsMsg||' '], cx, RTH*.69, 9, /COULD NOT|TOO BIG/.test(settingsMsg) ? '#e0603a' : '#78ff88', 'center', rw, false);
     textBlock(g,['MP3 / WAV / OGG / M4A, 40 MB MAX.','STAYS IN THIS BROWSER. NOTHING IS UPLOADED.','THE LIGHTS LOCK TO ITS TEMPO.'], cx, RTH*.77, 7, '#6a5a40', 'center', rw, false);
     textBlock(g,['[ESC] BACK'], cx, RTH*.91, 8, '#a08a60', 'center', rw, false);
@@ -205,40 +226,56 @@ function drawMenu(rw, t){
     textBlock(g,['ENTER ROOM CODE'], cx, RTH*.28, 11, '#cdb98a', 'center', rw, false);
     textBlock(g,[(joinCode+'____').slice(0,4).split('').join(' ')], cx, RTH*.40, 24, '#ffe14a', 'center', rw, false);
     textBlock(g,[netStatus||' '], cx, RTH*.60, 9, '#e0603a', 'center', rw, false);
-    textBlock(g,['[ENTER] JOIN   [ESC] BACK'], cx, RTH*.80, 8, '#a08a60', 'center', rw, false);
+    if(/COULD NOT CONNECT/.test(netStatus)) textBlock(g,['THE LINK TO THE HOST NEVER OPENED.','TRY: VPN OFF, ANOTHER WI-FI, RESTART THE BROWSER.'], cx, RTH*.67, 6, '#a06a4a', 'center', rw, false);
+    textBlock(g,['[BACKSPACE] FIX   [DEL] CLEAR','[ENTER] JOIN   [ESC] BACK'], cx, RTH*.78, 8, '#a08a60', 'center', rw, false);
   } else if(menuView==='lobby'){
     const host = net.role==='host', pids = host ? net.players.map(p=>p.pid) : net.lobby;
     textBlock(g,['ROOM CODE'], cx, RTH*.22, 9, '#a08a60', 'center', rw, false);
     textBlock(g,[net.code ? net.code.split('').join(' ') : '. . . .'], cx, RTH*.29, 26, '#ffe14a', 'center', rw, false);
     pids.forEach((pid,i)=> textBlock(g,[`${i+1}  ${COLS[i].n}${pid===net.pid?'  (YOU)':''}`], cx, RTH*.50+i*16, 10, COLS[i].css, 'center', rw, false));
+    const dn = DIFFS[host ? diffIdx : (net.lobbyDiff!==undefined ? net.lobbyDiff : 1)].name;
+    textBlock(g,[`DIFFICULTY: ${dn}${host?'   [D] CHANGE':''}`], cx, RTH*.72, 8, '#cdb98a', 'center', rw, false);
     const line = netStatus || (host ? (pids.length>=2 ? '[ENTER] START THE MATCH' : 'WAITING FOR 1-3 MORE PLAYERS...') : 'WAITING FOR THE HOST...');
     textBlock(g,[line], cx, RTH*.80, 8, '#cdb98a', 'center', rw, false);
     textBlock(g,['[ESC] LEAVE'], cx, RTH*.89, 7, '#6a5a40', 'center', rw, false);
   }
   menuL.tx.needsUpdate = true;
 }
+/* shown during the 10 s wait before each countdown; round 1 gets the headline rule */
+const TIPS = [
+  'WHOEVER OPENS THE DOOR\nCLOSEST TO THE ALARM WINS.',
+  'OPEN IT AS LATE AS YOU DARE.\nLET IT RING AND YOU LOSE {pen}.',
+  'THE CLOSER TO THE ALARM,\nTHE MORE POINTS YOU TAKE.',
+  'EVERYONE HAS A DIFFERENT TIMER.\nWATCH THE OTHER DOORS.',
+  'ONE SECOND EARLY IS STILL A GOOD DAY.\nONE SECOND LATE IS -{pen}.',
+];
 let hudKey = '';
 function drawHud(rw){
-  const key = [rw, live, state, ui.msg, ui.stat, ui.prompt, ui.toast, net.dead, ui.board ? JSON.stringify(ui.board) : ''].join('|');
+  const key = [rw, live, ui.hidden, state, ui.msg, ui.reveal, ui.preSecs, ui.pre ? ui.pre.n : 0, ui.stat, ui.prompt, ui.toast, net.dead, ui.board ? JSON.stringify(ui.board) : ''].join('|');
   if(key===hudKey) return; hudKey = key;
   const g = hudL.g; g.clearRect(0,0,rw,RTH);
-  if(live){
+  if(live && !ui.hidden){
     if(ui.board){
       const b = ui.board, rows = b.rows.slice();
       if(b.final) rows.sort((x,y)=>y.tot-x.tot);
       textBlock(g,[b.final ? 'FINAL SCORES' : `ROUND ${b.round} OF ${b.rounds}`], rw/2, 12, 12, '#e6d6a6', 'center', rw);
       rows.forEach((r,k)=>{
         const pts = (r.pts>0?'+':'')+r.pts;
-        textBlock(g,[`${r.name.padEnd(6)} ${pts.padStart(4)}   TOTAL ${String(r.tot).padStart(3)}${r.me?'  <-- YOU':'         '}`], rw/2, 42+k*17, 9, COLS[r.i].css, 'center', rw);
+        textBlock(g,[`${r.name.padEnd(6)} ${pts.padStart(4)}   TOTAL ${String(r.tot).padStart(3)}${r.me?'  <-- YOU':r.left?'  (LEFT)':'         '}`], rw/2, 42+k*17, 9, COLS[r.i].css, 'center', rw);
       });
       if(b.final){
         const top = Math.max(...rows.map(r=>r.tot)), w = rows.filter(r=>r.tot===top).map(r=>r.name).join(' & ');
         textBlock(g,[`WINNER: ${w}`,'[ENTER] BACK TO MENU'], rw/2, RTH-52, 11, '#ffe14a', 'center', rw);
-      } else textBlock(g,['NEXT ROUND SOON...'], rw/2, RTH-30, 8, '#bfae82', 'center', rw);
+      } else textBlock(g,[ui.preSecs>0 ? `NEXT ROUND IN ${ui.preSecs}` : 'NEXT ROUND SOON...'], rw/2, RTH-30, 8, '#bfae82', 'center', rw);
     } else {
-      if(state==='result' && ui.msg) textBlock(g, ui.msg.split('\n'), rw/2, RTH*.64, 11, '#e6d6a6', 'center', rw);
+      if(mp && ui.pre && ui.preSecs>0 && state==='idle' && !net.dead) textBlock(g,[`ROUND ${ui.pre.n} OF ${net.rounds}`,`STARTS IN ${ui.preSecs}`], rw/2, RTH-48, 10, '#bfae82', 'center', rw);
+      if(state==='result' && ui.msg) textBlock(g, ui.msg.split('\n'), rw/2, RTH*.64, 11, '#e6d6a6', 'center', rw, true, ui.reveal);
       if(state==='result' && !mp) textBlock(g, ui.stat.split('\n'), rw-8, 8, 7, '#bfae82', 'right', rw);
       if(ui.prompt && (state==='idle' || state==='result')){ const pl = ui.prompt.split('\n'); textBlock(g, pl, rw/2, RTH-14-pl.length*12, 8, '#ffe14a', 'center', rw); }
+    }
+    if(mp && ui.pre && ui.preSecs>0 && !net.dead && !(ui.board && ui.board.final)){          // the rule of the game, while everyone waits
+      const tip = TIPS[(ui.pre.n-1) % TIPS.length].replace(/\{pen\}/g, -END_PENALTY), below = ui.board ? 42 + ui.board.rows.length*17 + 8 : 14;
+      textBlock(g, tip.split('\n'), rw/2, below, 9, '#e6d6a6', 'center', rw);
     }
     if(ui.toast) textBlock(g,[ui.toast], rw/2, RTH*.46, 9, '#ff8a6a', 'center', rw);
     if(net.dead) textBlock(g,['THE HOST LEFT.','[ENTER] BACK TO MENU'], rw/2, RTH*.4, 12, '#ff8a6a', 'center', rw);
@@ -506,11 +543,28 @@ function makeMicrowave(x, col, mine){
   return { g, door:dr, spinner:sp, inLight:il, mine, doorOpen:0, doorTarget:0,
     disp:{ ctx:canvas.getContext('2d'), tex, plane, key:'' }, rs:{ phase:'idle', dur:0, startT:0, nextBeep:0 } };
 }
-const CAM_Z = [.84, 1.35, 1.85, 2.3];
+const CAM_Z = [.84, 1.35, 1.35, 1.35];
+const STACK_DY = .335;                                        // one microwave + a shelf
+let layoutDims = { cols:1, tiers:1 };
+/* where each player's microwave sits: 1-2 players in a row; 3 = two below, one stacked above; 4 = 2x2.
+   stacking keeps every screen big enough to read under the pixelation. */
+function slotsFor(n){
+  if(n<=1) return [{x:0,t:0}];
+  if(n===2) return [{x:-.31,t:0},{x:.31,t:0}];
+  if(n===3) return [{x:-.31,t:0},{x:.31,t:0},{x:.03,t:1,r:-.11}];
+  return [{x:-.31,t:0},{x:.31,t:0},{x:-.32,t:1,r:.12},{x:.30,t:1,r:-.08}];     // upper ones turned a little, like they were set down casually
+}
 function buildLayout(n, meIdx){
   while(mwRoot.children.length) mwRoot.remove(mwRoot.children[0]);
   mws.length = 0;
-  for(let i=0;i<n;i++) mws.push(makeMicrowave((i-(n-1)/2)*.62, COLS[i].hex, i===meIdx));
+  const slots = slotsFor(n);
+  slots.forEach((sl,i)=>{ const mw=makeMicrowave(sl.x, COLS[i].hex, i===meIdx); mw.g.position.y = sl.t*STACK_DY; mw.g.rotation.y = sl.r||0; mws.push(mw); });
+  if(n>=3){                                                   // a shelf (with end posts) under the upper tier
+    const wood = lamT(bodyTex,.4);
+    box(1.3,.03,.46, wood, 0,.93+.3+.015,0, mwRoot);
+    [-1,1].forEach(sd=> box(.035,.36,.42, wood, sd*.64,.9+.18,0, mwRoot));
+  }
+  layoutDims = { cols:n>=2?2:1, tiers:n>=3?2:1 };
   me = meIdx; const L = mws[me];
   door = L.door; spinner = L.spinner; inLight = L.inLight; dispPlane = L.disp.plane;
   L.g.add(dispLight);
@@ -611,10 +665,12 @@ function loopStop(h){ if(!h) return; h.g.gain.setTargetAtTime(0, ac.currentTime,
 /* cook hum: plays the whole file once (start-up included), then loops its tail as overlapping
    copies that each fade in and out, so it runs as long as the cook does. */
 let humRun=null, turntable=null, alarmSrc=null;
-function humStart(){
-  const b = sfxBuf.mw_hum; if(!ac || !b) return false;
+function humStart(vol=.8, pan=0){
+  const b = sfxBuf.mw_hum; if(!ac || !b) return null;
   const L=b.duration, seg=Math.min(L*.6,4), xf=Math.min(.6,seg/3), t0=ac.currentTime+.01;
-  const master=ac.createGain(); master.gain.value=.8; master.connect(ac.destination);
+  const master=ac.createGain(); master.gain.value=vol;
+  if(pan && ac.createStereoPanner){ const p=ac.createStereoPanner(); p.pan.value=pan; master.connect(p); p.connect(ac.destination); }   // other players' microwaves sit left/right of you
+  else master.connect(ac.destination);
   const copy=(offset,len,at,fadeIn)=>{
     const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=b;
     g.gain.setValueAtTime(fadeIn?0:1,at); if(fadeIn) g.gain.linearRampToValueAtTime(1,at+xf);
@@ -622,27 +678,34 @@ function humStart(){
     s.connect(g).connect(master); s.start(at,offset,len);
   };
   copy(0,L,t0,false);
-  humRun={master, next:t0+L-xf};
-  humRun.timer=setInterval(()=>{
-    while(humRun && humRun.next < ac.currentTime+.6){ copy(L-seg,seg,humRun.next,true); humRun.next += seg-xf; }
+  const h={master, next:t0+L-xf};
+  h.timer=setInterval(()=>{
+    while(h.next < ac.currentTime+.6){ copy(L-seg,seg,h.next,true); h.next += seg-xf; }
   },100);
-  return true;
+  return h;
 }
-function humStop(){
-  if(!humRun) return;
-  clearInterval(humRun.timer); humRun.master.gain.setTargetAtTime(0, ac.currentTime, .06); humRun=null;
+function humStop(h){
+  if(!h) return;
+  clearInterval(h.timer); try{ h.master.gain.setTargetAtTime(0, ac.currentTime, .06); }catch(e){}
 }
-function cookStart(){ if(!humStart()) hum_synth=true; turntable=loopStart('mw_turntable',.5); }
 /* the alarm is its own clip so it can be cut off the instant you open the door */
-function playAlarm(){
+function playAlarm(level=1){
   if(!ac) return; const b=sfxBuf.mw_alarm||sfxBuf.mw_end; if(!b) return;
-  stopAlarm(); const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=b; s.connect(g).connect(ac.destination); s.start(); alarmSrc={s,g};
+  stopAlarm(); const s=ac.createBufferSource(), g=ac.createGain(); g.gain.value=level; s.buffer=b; s.connect(g).connect(ac.destination); s.start(); alarmSrc={s,g};
 }
 function stopAlarm(){
   if(!alarmSrc) return; const {s,g}=alarmSrc; alarmSrc=null;
   try{ g.gain.setTargetAtTime(0, ac.currentTime, .03); s.stop(ac.currentTime+.2); }catch(e){}
 }
-function cookStop(){ stopAlarm(); humStop(); hum_synth=false; loopStop(turntable); turntable=null; }
+function playAlarmAt(vol, pan){            // another player's alarm: quieter, off to one side
+  if(!ac) return false; const b=sfxBuf.mw_alarm||sfxBuf.mw_end; if(!b) return false;
+  const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=b; g.gain.value=vol; s.connect(g);
+  if(pan && ac.createStereoPanner){ const p=ac.createStereoPanner(); p.pan.value=pan; g.connect(p); p.connect(ac.destination); } else g.connect(ac.destination);
+  s.start(); return true;
+}
+function stopRemote(mw){ if(mw.hum){ humStop(mw.hum); mw.hum=null; } }
+function cookStart(){ humRun=humStart(.8,0); if(!humRun) hum_synth=true; turntable=loopStart('mw_turntable',.5); }
+function cookStop(){ stopAlarm(); humStop(humRun); humRun=null; hum_synth=false; loopStop(turntable); turntable=null; }
 let hum_synth=false;
 
 /* room tone: starts with the lights; synth brown-noise drone if the file is missing */
@@ -667,6 +730,89 @@ function thunk(f=90,dur=.12,vol=.35){
   o.frequency.setValueAtTime(f,ac.currentTime); o.frequency.exponentialRampToValueAtTime(f*.5,ac.currentTime+dur);
   g.gain.setValueAtTime(vol,ac.currentTime); g.gain.exponentialRampToValueAtTime(.001,ac.currentTime+dur);
   o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime+dur+.02);
+}
+
+/* type sounds: short hand-rendered clicks, crushed (sample-and-hold + few levels) and dark.
+   menu = dark keystroke, code = a notch lighter and tighter, result = darker and heavier (typewriter responses) */
+const TYPE_CFG = {
+  menu:   { f:150, len:.075, hold:7, lv:6, tick:.55, sub:.95, decay:42 },
+  code:   { f:235, len:.052, hold:5, lv:8, tick:.75, sub:.55, decay:50 },
+  result: { f:100, len:.095, hold:9, lv:5, tick:.40, sub:1.0, decay:30 },
+};
+const typeBufs = {};
+function makeTypeBuf(kind, variant){
+  const c=TYPE_CFG[kind], sr=ac.sampleRate, n=Math.floor(sr*c.len), buf=ac.createBuffer(1,n,sr), d=buf.getChannelData(0);
+  const f0=c.f*(.9+.2*(variant/3));                                // four pitch variants so it never machine-guns
+  let ph=0, hold=0, prev=0;
+  for(let k=0;k<n;k++){
+    const t=k/sr, f=f0*(1-.45*Math.min(1,t/c.len)); ph+=2*Math.PI*f/sr;
+    let x=Math.sin(ph)*c.sub*Math.exp(-t*c.decay);                // the dull body of the key
+    const w=Math.random()*2-1; x+=(w-prev)*.5*c.tick*Math.exp(-t*230); prev=w;   // the tick
+    if(k%c.hold===0) hold=Math.round(Math.max(-1,Math.min(1,x*1.3))*c.lv)/c.lv;
+    d[k]=hold;
+  }
+  return buf;
+}
+function typeSfx(kind, vol=.5){
+  if(!ac || ac.state!=='running' || !TYPE_CFG[kind]) return;
+  const list = typeBufs[kind] || (typeBufs[kind] = [0,1,2,3].map(v=>makeTypeBuf(kind,v)));
+  const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=list[(Math.random()*list.length)|0];
+  s.playbackRate.value=.96+Math.random()*.08; g.gain.value=vol; s.connect(g).connect(ac.destination); s.start();
+}
+/* typewriter for the response lines: characters appear one by one with a dark tick; pauses at line ends and full stops */
+let typing=null, msgDoneAt=0, pendingRend=null;
+/* opening it AFTER the alarm: black for 4 s, a flatline and a charging whine, a big white shock, then the exposure
+   comes back down from blown-out as if you were resuscitated. the result text waits until you're back. */
+let death=null, deathUntil=0;
+function startDeath(onBack){
+  const now=performance.now(); death={ t0:now }; deathUntil=now+11000;
+  deathSfx(); setTimeout(()=>{ if(onBack) onBack(); }, 6200);
+}
+function deathTick(now){
+  let expo=1, fl=0;
+  if(death){
+    const e=(now-death.t0)/1000;
+    if(e<4.0) expo=0;                                         // sudden black, then four seconds of nothing
+    else if(e<4.12){ expo=0; fl=1; }                          // the shock
+    else { const k=e-4.12; fl=Math.exp(-k*2.2); expo=1+7*Math.exp(-k*.75); }   // blazing exposure, easing back to reality slowly
+    if(e>11) death=null;
+    ui.hidden = e<4.6;                                        // no text over the black
+  } else ui.hidden=false;
+  postMat.uniforms.expo.value=expo; postMat.uniforms.dflash.value=fl;
+}
+function deathSfx(){
+  if(!ac) return; const t=ac.currentTime;
+  menuSfx();                                                                           // lights out: the same bitcrushed drop as starting a game
+  const mk=(type,f0,f1,t0,t1,v0,v1)=>{ const o=ac.createOscillator(), g=ac.createGain(); o.type=type;
+    o.frequency.setValueAtTime(f0,t+t0); o.frequency.exponentialRampToValueAtTime(f1,t+t1);
+    g.gain.setValueAtTime(0.0001,t+t0); g.gain.linearRampToValueAtTime(v0,t+t0+.25); g.gain.linearRampToValueAtTime(v1,t+t1);
+    g.gain.setValueAtTime(v1,t+t1); g.gain.linearRampToValueAtTime(0.0001,t+t1+.05);
+    o.connect(g).connect(ac.destination); o.start(t+t0); o.stop(t+t1+.1); return {o,g}; };
+  mk('sine',1000,1000,.3,4.0,.09,.09);                                                 // the flatline
+  const wh=mk('sine',260,2600,.6,3.95,.02,.17);                                        // the defibrillator charging
+  const lfo=ac.createOscillator(), lg=ac.createGain(); lfo.frequency.value=13; lg.gain.value=.05; lfo.connect(lg).connect(wh.g.gain); lfo.start(t+.6); lfo.stop(t+4.0);
+  [3.45,3.62,3.79].forEach(b=>tone(t+b, 2800, 2800, .07, .13, 'square'));              // ready
+  tone(t+4.0, 78, 26, .75, 1.0, 'sine');                                               // the shock: a huge thump...
+  noiseBurst(t+4.0, .3, 'lowpass', 1500, .7, 1.0);
+  for(let i=0;i<9;i++) noiseBurst(t+4.01+i*.017, .012, 'bandpass', 3400+i*220, 2, .55);   // ...and a crackle
+  noiseBurst(t+4.4, .5, 'bandpass', 800, 1.2, .2, 1900);                               // a gasp
+  for(let b=0;b<6;b++){ const tb=t+4.75+b*.86;                                         // a heartbeat coming back, with the monitor's ping
+    tone(tb, 62, 38, .12, .6-b*.04, 'sine'); tone(tb+.19, 55, 34, .1, .42-b*.03, 'sine'); tone(tb, 1000, 1000, .045, .05, 'sine'); }
+}
+function setMsg(text){ ui.msg=text; ui.reveal=0; msgDoneAt=0; typing={ next:performance.now()+450, last:0 }; }
+function clearMsg(){ ui.msg=''; ui.reveal=-1; typing=null; }
+function typeTick(now){
+  if(!typing || ui.reveal<0) return;
+  while(now>=typing.next && ui.reveal<ui.msg.length){
+    const ch=ui.msg[ui.reveal]; ui.reveal++;
+    if(ch!==' ' && ch!=='\n' && now-typing.last>28){ typeSfx('result',.5); typing.last=now; }
+    typing.next += ch==='\n' ? 280 : (ch==='.'||ch==='?') ? 150 : 34;
+    if(typing.next<now-200) typing.next=now;                          // don't "catch up" in a burst after a stall
+  }
+  if(ui.reveal>=ui.msg.length){
+    ui.reveal=-1; typing=null; msgDoneAt=now;
+    if(pendingRend){ const go=pendingRend; pendingRend=null; setTimeout(go, 1800); }      // a beat to read it, then the summary
+  }
 }
 
 /* door sounds: a latch click, a plastic clack, a hinge creak and the thunk against the stop */
@@ -777,16 +923,31 @@ function makeRoom(ctx, wetAmt=.55, dryAmt=.6){
 function mkAnalyser(node){ const an=ac.createAnalyser(); an.fftSize=1024; an.smoothingTimeConstant=.3; node.connect(an); musicAnalyser=an; }
 /* the chain every real track goes through: tempo analysis, shelf, room, wall filter */
 function playMusicBuffer(buf){
-  const s=ac.createBufferSource(); s.buffer=buf; s.loop=true;
   const tm=analyseTempo(buf); window.__tempo=tm;
   /* heard through a wall: highs cut, lows lifted a little */
   const g=ac.createGain(); g.gain.value=.7;
   const lo=ac.createBiquadFilter(); lo.type='lowshelf'; lo.frequency.value=140; lo.gain.value=5;
   const lp=ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=2000; lp.Q.value=.5;
   const room=makeRoom(ac,.55,.6);
-  s.connect(lo); mkAnalyser(lo);                                    // fallback beat detection hears it before the reverb smears it
-  lo.connect(room.input); room.output.connect(lp).connect(g).connect(ac.destination); s.start();
-  if(tm.conf>1.6){ tempoGrid={ tStart:ac.currentTime, dur:buf.duration, period:tm.period, offset:tm.offset, last:-1 }; beatSource='grid'; }
+  const bus=ac.createGain();                                        // every copy of the track plays into this
+  bus.connect(lo); mkAnalyser(lo);                                  // fallback beat detection hears it before the reverb smears it
+  lo.connect(room.input); room.output.connect(lp).connect(g).connect(ac.destination);
+
+  /* seamless loop: ~4 s before the end the start fades in under the tail (equal-power), and so on forever */
+  const D=buf.duration, xf=Math.min(4, D/3), step=D-xf, N=48;
+  const up=new Float32Array(N), down=new Float32Array(N);
+  for(let i=0;i<N;i++){ const x=i/(N-1); up[i]=Math.sin(x*Math.PI/2); down[i]=Math.cos(x*Math.PI/2); }
+  const copy=(at, first)=>{
+    const s=ac.createBufferSource(), gg=ac.createGain(); s.buffer=buf;
+    if(first) gg.gain.setValueAtTime(1,at); else gg.gain.setValueCurveAtTime(up, at, xf);
+    gg.gain.setValueCurveAtTime(down, at+D-xf, xf);
+    s.connect(gg).connect(bus); s.start(at);
+  };
+  const t0=ac.currentTime+.05; let next=t0+step; copy(t0,true);
+  setInterval(()=>{ while(next < ac.currentTime+2){ copy(next,false); next+=step; } }, 250);
+
+  /* the beat grid restarts with every copy, so its period is the loop step */
+  if(tm.conf>1.6){ tempoGrid={ tStart:t0, dur:step, period:tm.period, offset:tm.offset, last:-1 }; beatSource='grid'; }
   else beatSource='detect';                                         // couldn't lock a tempo: fall back to listening
 }
 async function startMusic(){
@@ -931,13 +1092,14 @@ function startRun(forceDur){
   if(state!=='idle' || !started) return;
   dur = forceDur || (randomTime ? 15 + Math.floor(Math.random()*166) : preset);   // solo random: 15 s to 3 min
   startT = performance.now(); state='running'; stared=0;
-  ui.msg='';
+  clearMsg();
   if(!sfxBuf.mw_hum) sfx('mw_start',1,()=>{ thunk(110,.1,.4); beep(1800,.08,.08); }); // the real start-up is the head of mw_hum
   cookStart();
   setPrompt();
 }
+let alarmStartAt=0, dist=0;       // dist: 0..1, how far the alarm has worn you down
 function endRun(now){            // the timer hit zero: the -5 lands now, the alarm starts
-  state='done'; beeps=0; nextBeep=now; cookStop(); applyPts(END_PENALTY); emitEv('end',END_PENALTY,0); setPrompt();
+  alarmStartAt=now; state='done'; beeps=0; nextBeep=now; cookStop(); applyPts(END_PENALTY); emitEv('end',END_PENALTY,0); setPrompt();
 }
 function openDoor(){
   const now = performance.now();
@@ -1076,13 +1238,14 @@ function finish(leftDisp, rem, wasDone){
     else if(beeps<=3) m = pick('late', {n});
     else m = pick('ghost', {n});
   }
-  ui.msg = m + `\n${pts>0?'+':''}${pts} POINTS`;
+  const full = m + `\n${pts>0?'+':''}${pts} POINTS`;
+  if(wasDone) startDeath(()=>setMsg(full)); else setMsg(full);                // after the alarm: die first, then be told about it
   save(); setStat(); setPrompt();
   setTimeout(()=>sfx(!wasDone && leftDisp===1 ? 'result_psychopath' : 'result_weak', .9), 600);
 }
 function reset(){
-  if(state!=='result' || mp) return;
-  mws[me].doorTarget=0; state='idle'; ui.msg=''; sfx('mw_door_close',1,()=>doorCloseSynth());
+  if(state!=='result' || mp || death) return;
+  mws[me].doorTarget=0; state='idle'; clearMsg(); sfx('mw_door_close',1,()=>doorCloseSynth());
   spinner.rotation.y=0; setPrompt();
 }
 
@@ -1093,12 +1256,19 @@ const peerOK = () => typeof Peer !== 'undefined';
 const sendTo = (c,m) => { try{ if(c && c.open) c.send(m); }catch(e){} };
 const broadcast = (m, except) => net.conns.forEach(c=>{ if(c!==except) sendTo(c,m); });
 
+/* tell the room we're going, right now (a closing tab can take the network ~30 s to notice otherwise) */
+function sendBye(){
+  try{
+    if(net.role==='host') broadcast({t:'bye'});
+    else if(net.role==='client') sendTo(net.hostConn, {t:'bye'});
+  }catch(e){}
+}
 function leaveRoom(){
   try{ clearTimeout(net.roundTimer); net.peer && net.peer.destroy(); }catch(e){}
   Object.assign(net, { role:null, peer:null, conns:[], hostConn:null, pid:null, code:'', players:[], lobby:[], started:false, nextId:0 });
   netStatus=''; menuView='main';
 }
-function lobbyBroadcast(){ const pids = net.players.map(p=>p.pid); net.lobby = pids; broadcast({t:'lobby', pids}); }
+function lobbyBroadcast(){ const pids = net.players.map(p=>p.pid); net.lobby = pids; broadcast({t:'lobby', pids, diff:diffIdx}); }
 
 function hostRoom(tries=0){
   if(!peerOK()){ netStatus='NO NETWORK (CANNOT LOAD PEERJS)'; return; }
@@ -1128,13 +1298,15 @@ function hostPeerLeft(c){
   broadcast({t:'gone', pid}); markGone(pid); checkRoundEnd();
 }
 function hostOnData(c,m){
+  if(m && m.t==='bye'){ hostPeerLeft(c); return; }
+  if(m && m.t==='shown'){ net.shown = net.shown||{}; net.shown[c.__pid]=true; checkShown(); return; }
   if(!m || m.t!=='ev') return;
   m.pid = c.__pid; hostBook(m); onEvVisual(m); broadcast(m, c);      // relay to everyone else
 }
 function hostStart(){
   if(net.role!=='host' || net.players.length<2 || net.started) return;
   net.started = true; net.order = net.players.map(p=>p.pid); net.rounds = 5; net.round = 0; net.tot = {};
-  broadcast({t:'start', order:net.order, rounds:net.rounds});
+  broadcast({t:'start', order:net.order, rounds:net.rounds, diff:diffIdx});
   startMatch();
 }
 function joinRoom(code){
@@ -1158,9 +1330,11 @@ function hostLeft(){
 function clientOnData(m){
   if(!m) return;
   if(m.t==='welcome') net.pid = m.pid;
-  else if(m.t==='lobby') net.lobby = m.pids;
+  else if(m.t==='lobby'){ net.lobby = m.pids; net.lobbyDiff = m.diff; }
   else if(m.t==='full'){ netStatus='ROOM IS FULL'; menuView='join'; try{net.peer.destroy();}catch(e){} net.role=null; }
-  else if(m.t==='start'){ net.order=m.order; net.rounds=m.rounds; net.started=true; net.tot={}; startMatch(); }
+  else if(m.t==='start'){ if(m.diff!==undefined) setDiff(m.diff,false); net.order=m.order; net.rounds=m.rounds; net.started=true; net.tot={}; startMatch(); }
+  else if(m.t==='bye') hostLeft();
+  else if(m.t==='pre') setPre(m.n, m.secs);
   else if(m.t==='round') beginRound(m);
   else if(m.t==='ev') onEvVisual(m);
   else if(m.t==='rend') onRend(m);
@@ -1183,14 +1357,34 @@ function onEvVisual(m){
   else if(m.k==='end' && mw.rs.phase!=='opened'){ mw.rs.phase='ended'; }
 }
 function markGone(pid){
-  const i = net.order.indexOf(pid); if(i<0 || i===me || !mws[i]) return;
+  const i = net.order.indexOf(pid); if(i<0 || i===me || !mws[i] || net.gone[pid]) return;
+  net.gone[pid] = true;
   mws[i].rs.phase='gone'; mws[i].doorTarget=1;
+  showToast(`${COLS[i].n} LEFT THE MATCH`, 4500);
+  if(net.order.every((q,k)=>k===me || net.gone[q])) setTimeout(()=>showToast('EVERYONE ELSE HAS LEFT', 6000), 4600);
 }
 function startMatch(){
   mp = { n:net.order.length, me:net.order.indexOf(net.pid) };
-  buildLayout(mp.n, mp.me);
+  buildLayout(mp.n, mp.me); setPrompt();
   play();
 }
+/* a 10 s breather before every countdown: first round after the lights come on, later rounds after the scoreboard */
+const PRE_ROUND_S = 10;
+function checkShown(){
+  if(net.role!=='host' || net.scheduled || net.round>=net.rounds) return;
+  if(net.order.every(pid=>net.shown[pid] || net.gone[pid])){ net.scheduled=true; clearTimeout(net.roundTimer); hostSchedule(net.round+1); }
+}
+function ackShown(){                                            // "my scoreboard is up"
+  if(net.role==='host'){ net.shown = net.shown||{}; net.shown[net.pid]=true; checkShown(); }
+  else if(net.role==='client') sendTo(net.hostConn, {t:'shown'});
+}
+function hostSchedule(n){
+  if(net.role!=='host' || net.dead) return;
+  clearTimeout(net.roundTimer);
+  broadcast({t:'pre', n, secs:PRE_ROUND_S}); setPre(n, PRE_ROUND_S);
+  net.roundTimer = setTimeout(hostNextRound, PRE_ROUND_S*1000);
+}
+function setPre(n, secs){ ui.pre = { n, until: performance.now()+secs*1000 }; ui.preSecs = secs; }
 function hostNextRound(){
   if(net.role!=='host' || net.dead) return;
   net.round++; net.resolved={}; net.rpts={}; net.ending=false;
@@ -1204,10 +1398,11 @@ function hostNextRound(){
   broadcast(m); beginRound(m);
 }
 function beginRound(m){
-  net.round = m.n; net.rounds = m.rounds;
-  ui.board = null; ui.msg = '';
+  net.round = m.n; net.rounds = m.rounds; ui.pre = null; ui.preSecs = 0; death = null; deathUntil = 0; ui.hidden = false;
+  ui.board = null; clearMsg();
   net.order.forEach((pid,i)=>{
     const mw = mws[i]; mw.doorTarget=0; mw.spinner.rotation.y=0;
+    stopRemote(mw); mw.humTried=false;
     mw.rs = { phase:'run', dur:m.durs[pid], startT:performance.now(), nextBeep:0 };
   });
   cookStop(); state='idle'; started=true;
@@ -1222,15 +1417,27 @@ function hostRoundEnd(){
   net.order.forEach(pid=>{ pts[pid] = net.rpts[pid]||0; net.tot[pid] = (net.tot[pid]||0) + pts[pid]; });
   const final = net.round >= net.rounds;
   const m = { t:'rend', n:net.round, rounds:net.rounds, pts, tot:{...net.tot}, final };
+  if(!final){ net.shown = {}; net.scheduled = false; clearTimeout(net.roundTimer); }   // reset BEFORE anyone (incl. the host) reports their scoreboard
   broadcast(m); onRend(m);
-  if(!final) net.roundTimer = setTimeout(hostNextRound, 9000);
+  if(!final){                                                  // wait for everyone to see the scoreboard (a player may be mid-resuscitation)
+    net.roundTimer = setTimeout(()=>{ if(!net.scheduled){ net.scheduled=true; hostSchedule(net.round+1); } }, 18000);
+  }
 }
 function onRend(m){
-  mws.forEach(mw=>{ mw.doorTarget=1; });
+  /* don't cut off a message that's still typing (or was only just finished): wait for it, then show the summary */
+  const go = ()=>showRend(m);
+  if(death || deathUntil>performance.now()){ setTimeout(()=>onRend(m), Math.max(200, deathUntil-performance.now()+200)); return; }
+  if(typing){ pendingRend = go; return; }
+  const since = performance.now() - msgDoneAt;
+  if(msgDoneAt && since < 1800) setTimeout(go, 1800-since); else go();
+}
+function showRend(m){
+  ackShown();
+  mws.forEach(mw=>{ mw.doorTarget=1; stopRemote(mw); });
   if(state==='running' || state==='done'){ cookStop(); }
-  state='result'; ui.msg='';
+  state='result'; clearMsg();
   ui.board = { round:m.n, rounds:m.rounds, final:m.final,
-    rows: net.order.map((pid,i)=>({ i, name:COLS[i].n, pts:m.pts[pid]||0, tot:m.tot[pid]||0, me:i===me })) };
+    rows: net.order.map((pid,i)=>({ i, name:COLS[i].n, pts:m.pts[pid]||0, tot:m.tot[pid]||0, me:i===me, left:!!net.gone[pid] })) };
 }
 
 /* ---------- custom music: stored in this browser (IndexedDB), never uploaded ---------- */
@@ -1259,16 +1466,24 @@ idbGet('music').then(rec=>{ if(rec) customInfo = { name:rec.name, bpm:0 }; if(re
 function settingsAction(k){
   if(k==='u') fileIn.click();
   else if(k==='c' && customInfo){ idbDel('music').catch(()=>{}); customInfo=null; settingsMsg='BACK TO THE BUILT-IN TRACK'; }
+  else if(k==='d'){ setDiff(diffIdx+1); settingsMsg = `${DIFFS[diffIdx].name}: LETTING IT RING COSTS ${-END_PENALTY}`; }
   else if(k==='t'){ randomTime=!randomTime; try{ localStorage.setItem('mw-random-time', randomTime?'on':'off'); }catch(e){} settingsMsg = randomTime ? 'SOLO TIMER IS RANDOM' : 'SOLO: YOU PICK THE TIME'; setPrompt(); }
   else if(k==='l'){ musicMode = musicMode==='legacy' ? 'new' : 'legacy'; try{ localStorage.setItem('mw-music-mode', musicMode); }catch(e){} settingsMsg = musicMode==='legacy' ? 'LEGACY SYNTH. PLAYS NEXT GAME.' : 'NEW SYNTH. PLAYS NEXT GAME.'; }
 }
 
 /* ---------- input ---------- */
 let escUntil=0, toastT=null;
+function showToast(text, ms=3000){ ui.toast=text; clearTimeout(toastT); toastT=setTimeout(()=>{ ui.toast=''; }, ms); }
 function leaveToMenu(){               // back to the main menu (a reload: clean state, music and room dropped)
   const now = performance.now();
-  if(mp && now>escUntil){ escUntil=now+2500; ui.toast='PRESS ESC AGAIN TO LEAVE THE MATCH'; clearTimeout(toastT); toastT=setTimeout(()=>{ ui.toast=''; },2500); return; }
-  location.reload();
+  if(mp && now>escUntil){ escUntil=now+2500; showToast('PRESS ESC AGAIN TO LEAVE THE MATCH', 2500); return; }
+  sendBye();
+  if(phase!=='live'){ location.reload(); return; }              // still in the intro: nothing to dissolve
+  if(phase==='leaving') return;
+  phase='leaving'; leaving=true; leavingAt=performance.now();
+  menuSfx();                                                      // the same bitcrushed drop as pressing play
+  setTimeout(()=>{ try{ if(ac) ac.suspend(); }catch(e){} }, 1450);   // everything goes silent once it's black
+  setTimeout(()=>location.reload(), 2700);                         // ...then the menu pops up
 }
 function menuAction(k){
   if(k==='p') startSolo();
@@ -1287,17 +1502,37 @@ function menuKey(e, k){
     if(k==='escape' || k==='enter' || k==='backspace') menuView='main';
   } else if(menuView==='join'){
     if(k==='escape'){ menuView='main'; netStatus=''; }
-    else if(k==='backspace') joinCode = joinCode.slice(0,-1);
+    else if(k==='backspace'){ joinCode = joinCode.slice(0,-1); netStatus=''; }          // fix a typo
+    else if(k==='delete'){ joinCode=''; netStatus=''; }                                   // wipe it
     else if(k==='enter'){ if(joinCode.length===4) joinRoom(joinCode); }
-    else if(/^[a-z]$/.test(k) && joinCode.length<4) joinCode += k.toUpperCase();
+    else if(/^[a-z]$/.test(k) && !(e.metaKey||e.ctrlKey||e.altKey)){
+      if(joinCode.length>=4) joinCode='';                                                 // typing into a full code starts over
+      joinCode += k.toUpperCase(); netStatus='';
+    }
   } else if(menuView==='lobby'){
     if(k==='escape') leaveRoom();
     else if(k==='enter') hostStart();
+    else if(k==='d' && net.role==='host'){ setDiff(diffIdx+1); lobbyBroadcast(); }
   }
 }
 addEventListener('keydown', e=>{
   const k = e.key.toLowerCase();
-  if(phase==='menu'){ if(ac) ac.resume().then(menuAmbStart); menuKey(e,k); return; }
+  /* keys the browser would otherwise act on (Backspace = back / close tab in some browsers, Delete, Tab, arrows scrolling):
+     the game owns them, so stop the page from seeing them */
+  if(k==='backspace' || k==='delete' || k==='tab' || k===' ' || k.startsWith('arrow')) e.preventDefault();
+  if(phase==='leaving') return;
+  if(phase==='menu'){
+    if(ac) ac.resume().then(menuAmbStart);
+    /* which sound: letters/backspace in the room-code box get the lighter "code" key; other menu actions get the dark "menu" key.
+       starting a game has its own bigger sound, so it stays quiet here. */
+    let kind=null;
+    if(menuView==='join' && (/^[a-z]$/.test(k) || k==='backspace' || k==='delete')) kind='code';
+    else if(menuView==='main' && (k==='enter' || k===' ' || k==='p')) kind=null;
+    else if(menuView==='lobby' && k==='enter') kind=null;
+    else if(k==='enter' || k==='escape' || k==='backspace' || /^[phjisucltd]$/.test(k)) kind='menu';
+    menuKey(e,k); if(kind) typeSfx(kind);
+    return;
+  }
   if(k==='escape'){ e.preventDefault(); leaveToMenu(); return; }
   if(!started) return;
   if(mp){
@@ -1316,11 +1551,12 @@ addEventListener('keydown', e=>{
   }
 });
 addEventListener('pointerdown', e=>{
+  if(phase==='leaving') return;
   if(phase==='menu'){
     const y = e.clientY/innerHeight*RTH;
-    if(menuView==='main'){ const i = menuRowAt(y); if(i>=0){ if(ac) ac.resume().then(menuAmbStart); menuAction(MENU_ITEMS[i][0]); } }
-    else if(menuView==='help') menuView='main';
-    else if(menuView==='settings'){ const k = settingsRowAt(y); if(k==='escape') menuView='main'; else if(k) settingsAction(k); }
+    if(menuView==='main'){ const i = menuRowAt(y); if(i>=0){ if(ac) ac.resume().then(menuAmbStart); const a=MENU_ITEMS[i][0]; menuAction(a); if(a!=='p') typeSfx('menu'); } }
+    else if(menuView==='help'){ menuView='main'; typeSfx('menu'); }
+    else if(menuView==='settings'){ const k = settingsRowAt(y); if(k==='escape') menuView='main'; else if(k) settingsAction(k); if(k) typeSfx('menu'); }
     else if(menuView==='lobby' && y>RTH*.76 && y<RTH*.86) hostStart();
     return;
   }
@@ -1332,16 +1568,24 @@ addEventListener('pointerdown', e=>{
   }
   if(state==='idle') startRun(); else if(state==='running'||state==='done') openDoor(); else reset();
 });
-let mx=0,my=0;
+let mx=0,my=0, tx=0,ty=0, pointerIn=false;          // mx/my: smoothed parallax; tx/ty: where the cursor wants it
 addEventListener('pointermove', e=>{
-  mx=e.clientX/innerWidth*2-1; my=e.clientY/innerHeight*2-1;
+  tx=e.clientX/innerWidth*2-1; ty=e.clientY/innerHeight*2-1; pointerIn=true;
   menuHover = (phase==='menu' && menuView==='main') ? menuRowAt(e.clientY/innerHeight*RTH) : -1;
   document.body.style.cursor = menuHover>=0 ? 'pointer' : 'default';
 });
-addEventListener('beforeunload', ()=>{ try{ net.peer && net.peer.destroy(); }catch(e){} });
+const cursorLeft = ()=>{ tx=0; ty=0; pointerIn=false; menuHover=-1; };     // the view drifts back to centre, slowly
+document.addEventListener('mouseleave', cursorLeft); addEventListener('blur', cursorLeft);
+addEventListener('paste', e=>{                                // paste a room code straight in
+  if(phase!=='menu' || menuView!=='join') return;
+  const t=((e.clipboardData && e.clipboardData.getData('text'))||'').toUpperCase().replace(/[^A-Z]/g,'').slice(0,4);
+  if(t){ joinCode=t; netStatus=''; typeSfx('code'); }
+});
+addEventListener('pagehide', sendBye);
+addEventListener('beforeunload', ()=>{ sendBye(); try{ net.peer && net.peer.destroy(); }catch(e){} });
 
 /* menu -> dissolve (1s) -> black (4s) -> lights, buzz and music slam in */
-let live=false, liveAt=0, phase='menu', dissolveAt=0;
+let live=false, liveAt=0, phase='menu', dissolveAt=0, leaving=false, leavingAt=0;
 function startSolo(){ mp=null; buildLayout(1,0); setPrompt(); setStat(); play(); }
 function play(){
   if(phase!=='menu') return;
@@ -1351,7 +1595,7 @@ function play(){
   setTimeout(()=>{
     phase='live'; live=true; liveAt=performance.now(); started=true;
     startMusic(); startAmbient(); startBuzz();
-    if(mp && net.role==='host') setTimeout(hostNextRound, 1800);
+    if(mp && net.role==='host') hostSchedule(1);
   }, 5000); // 1s dissolve + 4s of black
 }
 
@@ -1396,7 +1640,7 @@ setPrompt(); setStat(); resize(); addEventListener('resize', resize);
 audioInit(); if(ac) ac.onstatechange=()=>menuAmbStart(); menuAmbStart();
 if(QUIET){
   window.__mw = { net, mws, get mp(){return mp}, get state(){return state}, get phase(){return phase}, get menuView(){return menuView},
-    get netStatus(){return netStatus}, key:k=>dispatchEvent(new KeyboardEvent('keydown',{key:k})), hostRoom, joinRoom, hostStart, buildTechno, analyseTempo, fileIn, get customInfo(){return customInfo}, get settingsMsg(){return settingsMsg} };
+    get netStatus(){return netStatus}, key:k=>dispatchEvent(new KeyboardEvent('keydown',{key:k})), hostRoom, joinRoom, hostStart, buildTechno, analyseTempo, fileIn, get customInfo(){return customInfo}, get settingsMsg(){return settingsMsg}, get ui(){return ui}, get typing(){return typing}, typeTick };
   if(!/[?&]menu/.test(location.search)) startSolo();
 }
 
@@ -1422,8 +1666,9 @@ function frame(now){
     drawDisplay('0:00', Math.floor(t*2)%2===0, L);
     if(now>=nextBeep){
       beeps++;
-      if(sfxBuf.mw_alarm || sfxBuf.mw_end){ playAlarm(); nextBeep=now+8000; }
-      else if(sfxBuf.mw_ding){ [0,850,1700].forEach(d=>setTimeout(()=>sfx('mw_ding',.9),d)); nextBeep=now+5200; }
+      const level = Math.min(2.4, 1 + .45*(beeps-1));                       // louder every time it goes round
+      if(sfxBuf.mw_alarm || sfxBuf.mw_end){ playAlarm(level); nextBeep = now + Math.max(4600, 8000 - 1100*(beeps-1)); }   // ...and it comes back sooner
+      else if(sfxBuf.mw_ding){ [0,850,1700].forEach(d=>setTimeout(()=>sfx('mw_ding',Math.min(1.8,.9*level)),d)); nextBeep=now+5200; }
       else { beep(2300,.14,.12); setTimeout(()=>beep(2300,.14,.12),220); setTimeout(()=>beep(2300,.14,.12),440); nextBeep=now+3200; }
     }
   } else if(state==='idle'){
@@ -1437,14 +1682,16 @@ function frame(now){
   mws.forEach((mw,i)=>{
     const mine = i===me, rs = mw.rs;
     if(!mine){
+      const pan = Math.max(-1, Math.min(1, mw.g.position.x*1.3));
       if(rs.phase==='run'){
         const rem = Math.max(0, rs.dur-(now-rs.startT)/1000);
+        if(!mw.hum && !mw.humTried){ mw.humTried=true; mw.hum=humStart(.16, pan); }         // you can hear them cooking, quietly
         drawDisplay(fmt(Math.ceil(rem)), true, mw); mw.spinner.rotation.y += dt*.9;
-        if(rem<=0){ rs.phase='ended'; rs.nextBeep=now; }
+        if(rem<=0){ rs.phase='ended'; rs.nextBeep=now; stopRemote(mw); }
       } else if(rs.phase==='ended'){
         drawDisplay('0:00', Math.floor(t*2)%2===0, mw);
-        if(now>=rs.nextBeep){ rs.nextBeep=now+5200; beep(2000,.12,.03); }
-      } else if(rs.phase==='opened' || rs.phase==='gone') drawDisplay('--:--', false, mw);
+        if(now>=rs.nextBeep){ rs.nextBeep=now+8000; if(!playAlarmAt(.2, pan)) beep(2000,.12,.03); }
+      } else if(rs.phase==='opened' || rs.phase==='gone'){ stopRemote(mw); drawDisplay('--:--', false, mw); }
       else drawDisplay('--:--', true, mw);
     }
     mw.doorOpen += (mw.doorTarget-mw.doorOpen)*Math.min(1,dt*7);
@@ -1485,23 +1732,37 @@ function frame(now){
   if(live) mws.forEach(mw=>mw.disp.plane.material.color.setScalar(.8+.2*flEff));
   if(buzzGain) buzzGain.gain.value = .008 + .03*flEff + (flEff<.5 ? .02 : 0);
 
+  if(ui.pre){ const sec=Math.max(0, Math.ceil((ui.pre.until-now)/1000)); if(sec!==ui.preSecs) ui.preSecs=sec; if(sec===0 && now>ui.pre.until+500) ui.pre=null; }
+  { const a=(now-alarmStartAt)/1000, target = (state==='done' && !death) ? (a<4 ? a/4 : 1+Math.min(1,(a-4)/22)) : 0;    // black edges by 4 s, then a pinhole
+    dist += (target-dist)*Math.min(1, dt*(target>dist ? 1.2 : 3)); postMat.uniforms.vig.value = dist; }
+  deathTick(now);
+  typeTick(now);
   beatTick(now, dt);
 
   /* camera: sway and parallax; pulls back to fit every player's microwave */
   /* pull back until the whole row of microwaves fits the window, whatever its shape */
-  const fitZ = mws.length>1 ? ((mws.length-1)*.62+.95) / (2*Math.tan(cam.fov*Math.PI/360)*cam.aspect) : 0;
-  const camZ = Math.max(camBaseZ, fitZ) * (1 - (mp ? .05 : .13)*progressSmooth);      // creeps in as the timer runs down
+  const halfTan = Math.tan(cam.fov*Math.PI/360), lift = layoutDims.tiers>1 ? STACK_DY/2 : 0;
+  const fitW = layoutDims.cols>1 ? ((layoutDims.cols-1)*.62+.95) / (2*halfTan*cam.aspect) : 0;
+  const fitH = layoutDims.tiers>1 ? (STACK_DY+.3+.62) / (2*halfTan) : 0;
+  const fitZ = Math.max(fitW, fitH);
+  const camZ = Math.max(camBaseZ, fitZ) * (1 - (mp ? .06 : .15)*Math.pow(progressSmooth,2));   // creeps in slowly, then faster as the timer runs down
+  mx += (tx-mx)*Math.min(1, dt*(pointerIn ? 5 : .7)); my += (ty-my)*Math.min(1, dt*(pointerIn ? 5 : .7));   // eased; very slow when the cursor has left
   /* idle: a slow breath (about 6s), a very slow drift, and a faint tilt rocking left to right */
   const TAU=Math.PI*2, breath=Math.sin(t*TAU/6.2)+.3*Math.sin(t*TAU/3.1+.8);
   const drift=Math.sin(t*TAU/23), roll=Math.sin(t*TAU/17)*.014 + Math.sin(t*TAU/9.3+1.2)*.004;
-  cam.position.set(mx*.06 + drift*.02, 1.14 + breath*.006 - my*.02, camZ + breath*.005);
-  cam.lookAt(.02 + mx*.03 + drift*.015, 1.08 - my*.015 + breath*.003, 0);
+  cam.position.set(mx*.06 + drift*.02, 1.14 + lift + breath*.006 - my*.02, camZ + breath*.005);
+  cam.lookAt(.02 + mx*.03 + drift*.015, 1.08 + lift - my*.015 + breath*.003, 0);
   cam.rotateZ(roll);
+  if(dist>.01){                                                  // the longer it rings, the more the camera shakes
+    const a=Math.min(dist,1.3)*Math.min(dist,1.3)*.016;
+    cam.position.x += (Math.sin(t*53)+Math.sin(t*37+1.3))*a; cam.position.y += (Math.sin(t*47+.4)+Math.sin(t*61))*a*.7;
+    cam.rotateZ((Math.sin(t*43)+Math.sin(t*29+2))*Math.min(dist,1.3)*.01);
+  }
 
   postMat.uniforms.time.value = t;
-  postMat.uniforms.mA.value = phase==='menu' ? 1 : phase==='dissolve' ? Math.max(0,1-(now-dissolveAt)/1000) : 0;
-  postMat.uniforms.blk.value = phase==='live' ? 0 : 1;
-  if(phase==='menu'||phase==='dissolve') drawMenu(rt.width, t);
+  postMat.uniforms.mA.value = phase==='menu' ? 1 : phase==='dissolve' ? Math.max(0,1-(now-dissolveAt)/1000) : phase==='leaving' ? Math.min(1,(now-leavingAt)/1000) : 0;
+  postMat.uniforms.blk.value = (phase==='live' || phase==='leaving') ? 0 : 1;
+  if(phase==='menu'||phase==='dissolve'||phase==='leaving') drawMenu(rt.width, t);
   drawHud(rt.width);
   renderer.setRenderTarget(rt); renderer.render(scene, cam);
   renderer.setRenderTarget(null); renderer.render(post, postCam);

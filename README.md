@@ -1,16 +1,29 @@
 # Microwave Staring Sim
 
-A browser game about staring at a microwave, and deciding when to open the door. Solo, or online with 2-4 players (peer-to-peer).
+A browser game about staring at a microwave and deciding when to open the door. Solo, or online with 2-4 players (peer-to-peer).
 
-Open `index.html` in a browser, or play it on GitHub Pages. Press `I` on the menu for the rules, `S` for settings. `Esc` goes back to the menu from anywhere.
+Open `index.html` in a browser, or play it on GitHub Pages. `I` on the menu shows the rules, `S` opens settings, `Esc` goes back to the menu from anywhere.
 
-**Solo:** the timer is random between 0:15 and 3:00 each run. Turn that off in **Settings** to choose your own (`1`-`6` or the arrow keys).
+**Solo:** the timer is a random 0:15 to 3:00 each run. Turn that off in **Settings** to pick your own (`1`-`6` or the arrow keys).
 
-**Scoring:** open the door as late as you dare. The last 0.002 seconds is +15, then +14 out to about 0.25s, +13 at 0.5s, +12 at 1s, +8 at 5s, +3 at 10s, +1 at 14s and 0 from 20s on. Letting it end is -5. Opening after the clock has hit zero counts as letting it end.
+**Scoring (Normal):** open the door as close to the alarm as you can.
 
-**Online:** one player hosts a room and shares the 4-letter code. Connections use WebRTC via the public [PeerJS](https://peerjs.com) broker (loaded from jsDelivr) and Google STUN servers. No game data passes through a server after connecting. Five rounds, a different timer for everyone each round, most points wins.
+| seconds away | points |
+|---|---|
+| the last few milliseconds | +15 |
+| 0.5 s | +5 |
+| 1 s | +3 |
+| 2 s | +2 |
+| 4 s | +1 |
+| 8 s or more | 0 |
 
-**Music:** a synthesized dark techno track plays by default, heard "through a wall" (room reverb, highs cut), and the window outside flashes blue on every kick. **Settings** lets you switch to the Legacy Synth (the original track) or load your own audio file (mp3, wav, ogg or m4a, 40 MB max). Your file is stored only in your browser (IndexedDB) and is never uploaded. The game measures its tempo so the lights lock to the beat.
+Letting it ring costs points. **Difficulty** (Settings for solo, the host's lobby for online) squeezes the distances and raises the penalty: Easy -3, Normal -5, Hard -8, Brutal -12.
+
+Leave it ringing and the alarm gets louder, the screen darkens from the edges and the camera shakes. Open the door after it has gone off and you get a defibrillator-style black-out, then a white-out that fades back to normal.
+
+**Online:** one player hosts a room and shares the 4-letter code (Backspace fixes a typo, Delete clears, you can paste). Connections use WebRTC via the public [PeerJS](https://peerjs.com) broker (loaded from jsDelivr) and Google STUN servers. No game data passes through a server after connecting. Five rounds with a 10 second wait before each countdown, a different timer for everyone, a stacked layout for 3-4 players, and you can hear the others' microwaves, quietly. Everyone is told when someone leaves. If a VPN or strict network blocks peer-to-peer links, the room will fail to connect; try without the VPN or on another network.
+
+**Music:** a synthesized dark techno track plays by default, heard "through a wall" (room reverb, highs cut), and the window outside flashes blue on every kick. **Settings** can switch to the Legacy Synth (the original track) or load your own audio file (mp3, wav, ogg or m4a, 40 MB max). Your file is stored only in your browser (IndexedDB) and is never uploaded, and the game measures its tempo so the lights lock to the beat.
 
 ## Credits
 
