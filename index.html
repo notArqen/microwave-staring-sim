@@ -1,0 +1,1192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Microwave Staring Sim</title>
+<style>
+  html,body { margin:0; height:100%; background:#000; overflow:hidden; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; cursor:default; }
+</style>
+</head>
+<body>
+<script src="three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+(() => {
+'use strict';
+const QUIET = /[?&]quiet/.test(location.search);   // dev: no audio, auto-start
+if(QUIET){ window.AudioContext=undefined; window.webkitAudioContext=undefined; }
+
+/* ---------- renderer: tiny render target, chunky post pass ---------- */
+const RTH = 300;
+const renderer = new THREE.WebGLRenderer({ antialias:false });
+renderer.setPixelRatio(1);
+document.body.prepend(renderer.domElement);
+
+const snapRes = { value:new THREE.Vector2(160,120) };
+const rt = new THREE.WebGLRenderTarget(320, RTH, { minFilter:THREE.NearestFilter, magFilter:THREE.NearestFilter });
+
+const post = new THREE.Scene();
+const postCam = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+const postMat = new THREE.ShaderMaterial({
+  uniforms:{ t:{value:rt.texture}, res:{value:new THREE.Vector2(320,RTH)}, time:{value:0}, boost:{value:1.9},
+    hud:{value:null}, menu:{value:null}, mA:{value:1}, blk:{value:1} },
+  vertexShader:`varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }`,
+  fragmentShader:`
+    precision highp float;
+    uniform sampler2D t; uniform sampler2D hud; uniform sampler2D menu;
+    uniform vec2 res; uniform float time; uniform float boost; uniform float mA; uniform float blk;
+    varying vec2 vUv;
+    float b2(vec2 a){ a=floor(a); return fract(a.x/2.+a.y*a.y*.75); }
+    float b4(vec2 a){ return b2(.5*a)*.25+b2(a); }
+    float h(vec2 p){ return fract(sin(dot(p,vec2(12.9898,78.233)))*43758.5453); }
+    vec3 pal(float i){
+      if(i<.5) return vec3(.05,.025,.04);
+      if(i<1.5) return vec3(.19,.08,.10);
+      if(i<2.5) return vec3(.35,.28,.25);
+      if(i<3.5) return vec3(.55,.38,.38);
+      if(i<4.5) return vec3(.71,.57,.50);
+      return vec3(.86,.76,.64);
+    }
+    void main(){
+      vec2 px = floor(vUv*res);
+      vec2 uv = (px+.5)/res;
+      vec3 c = texture2D(t,uv).rgb * boost;
+      /* text and menu live in the same low-res pipeline, so they get the same dither + palette */
+      vec4 hu = texture2D(hud,uv); c = mix(c, hu.rgb, hu.a);
+      if(blk>.5) c = vec3(0.);
+      vec4 mn = texture2D(menu,uv);
+      float show = (mA > .001 && mA > h(floor(px*.5)*2.+3.)) ? 1. : 0.;
+      c = mix(c, mn.rgb, mn.a*show);
+      float l = dot(c, vec3(.3,.59,.11));
+      l = pow(l, .72);
+      float d = (b4(px)-.47)*.2;
+      float idx = clamp(floor((l+d)*6.+.5), 0., 5.);
+      vec3 p = pal(idx);
+      vec3 tint = clamp(c/(l+.03), .45, 2.2);
+      vec3 o = mix(p, p*tint, .5);
+      /* second posterize pass, per channel */
+      o = floor(o*7.+.5)/7.;
+      /* grain + vignette */
+      float g = h(px+floor(time*12.))-.5;
+      o += g*.045;
+      vec2 q = vUv-.5;
+      o *= 1.-dot(q,q)*1.35;
+      gl_FragColor = vec4(o,1.);
+    }`
+});
+post.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2), postMat));
+
+/* ---------- low-res text layers (hud + menu) ---------- */
+const mkLayer = () => { const c=document.createElement('canvas'); const tx=new THREE.CanvasTexture(c);
+  tx.minFilter=tx.magFilter=THREE.NearestFilter; tx.generateMipmaps=false; return {c, g:c.getContext('2d'), tx}; };
+const hudL = mkLayer(), menuL = mkLayer();
+postMat.uniforms.hud.value = hudL.tx; postMat.uniforms.menu.value = menuL.tx;
+const ui = { prompt:'', stat:'', msg:'', board:null };
+const FONT = 'ui-monospace,"Courier New",monospace';
+
+/* draws a block of lines on a dark plate; shrinks the font until it fits */
+function textBlock(g, lines, x, y, size, color, align, rw, plate=true){
+  let s = size, widest = 0;
+  const setF = () => { g.font = `bold ${s}px ${FONT}`; try{ g.letterSpacing = Math.max(0,Math.round(s/8))+'px'; }catch(e){} };
+  setF(); const meas = () => Math.max(...lines.map(l=>g.measureText(l).width));
+  widest = meas();
+  while(widest > rw-10 && s>5){ s--; setF(); widest = meas(); }
+  const lh = Math.round(s*1.5), hgt = lines.length*lh, pad = 3;
+  let left = align==='center' ? x-widest/2 : align==='right' ? x-widest : x;
+  left = Math.round(left); y = Math.round(y);
+  if(plate){ g.fillStyle='rgba(0,0,0,.72)'; g.fillRect(left-pad, y-pad, widest+pad*2, hgt+pad*2-(lh-s)); }
+  g.textBaseline='top'; g.textAlign='left';
+  lines.forEach((l,i)=>{
+    const ly = y + i*lh, lx = align==='center' ? Math.round(x - g.measureText(l).width/2) : left;
+    g.fillStyle='#000'; g.fillText(l,lx+1,ly+1);
+    g.fillStyle=color; g.fillText(l,lx,ly);
+  });
+  return s;
+}
+let fl=1, flickTarget=1, flickNext=0;
+
+/* ---------- state shared by menu, hud and game (declared early: the menu draws from it) ---------- */
+const COLS = [
+  {n:'RED',    hex:0xd8453a, css:'#ff7a68'},
+  {n:'BLUE',   hex:0x3a82e0, css:'#78b0ff'},
+  {n:'YELLOW', hex:0xe0c43a, css:'#ffe45a'},
+  {n:'GREEN',  hex:0x4fc45a, css:'#78ff88'},
+];
+let mp = null;                        // null = solo, otherwise { n, me } for an online match
+let menuView = 'main', joinCode = '', menuHover = -1, netStatus = '';
+const net = { role:null, peer:null, conns:[], hostConn:null, pid:null, code:'', players:[], lobby:[], order:[],
+  round:0, rounds:5, resolved:{}, rpts:{}, tot:{}, started:false, dead:false, roundTimer:null, nextId:0 };
+const MENU_ITEMS = [['p','SOLO'],['h','HOST A ROOM'],['j','JOIN A ROOM'],['i','HOW TO PLAY']];
+const menuRowY = i => RTH*.52 + i*19;
+const menuRowAt = y => { const i = Math.round((y-RTH*.52)/19); return (i>=0 && i<MENU_ITEMS.length && Math.abs(y-menuRowY(i))<10) ? i : -1; };
+
+/* scoring: seconds away from the end -> points, linear between anchors. letting it end costs points. */
+const POINTS_CURVE = [[0,15],[.5,14],[10,3],[14,1],[20,0]];
+const END_PENALTY = -5;
+function pointsFor(rem){
+  const c = POINTS_CURVE;
+  if(rem <= c[0][0]) return c[0][1];
+  for(let i=1;i<c.length;i++) if(rem <= c[i][0]){
+    const [x0,y0]=c[i-1], [x1,y1]=c[i];
+    return Math.round(y0 + (y1-y0)*(rem-x0)/(x1-x0));
+  }
+  return 0;
+}
+function helpLines(){
+  const row = (label,v) => label.padEnd(26) + ((v>0?'+':'')+v).padStart(4);
+  return ['HOW TO PLAY','',
+    'A MICROWAVE COUNTS DOWN.','OPEN THE DOOR [E / SPACE / CLICK]','AS LATE AS YOU DARE.','',
+    row('RIGHT BEFORE IT ENDS',pointsFor(0)), row('0.5 SECONDS AWAY',pointsFor(.5)), row('10 SECONDS AWAY',pointsFor(10)),
+    row('14 SECONDS AWAY',pointsFor(14)), row('20+ SECONDS AWAY',pointsFor(20)), row('LET IT END',END_PENALTY),'',
+    'ONLINE: 2-4 PLAYERS, 5 ROUNDS.','EVERYONE HAS A MICROWAVE AND A','DIFFERENT TIMER. YOURS HAS THE','GREEN SCREEN. MOST POINTS WINS.','','[ESC] BACK'];
+}
+
+/* menu: slow dust, a scan band, a flickering title and a far-off green display */
+const dust = Array.from({length:44},()=>({x:Math.random(),y:Math.random(),vx:(Math.random()-.5)*.0016,vy:-.0008-Math.random()*.0022,p:Math.random()*6}));
+let glitch = 0;
+function drawMenu(rw, t){
+  const g = menuL.g;
+  g.fillStyle='#050403'; g.fillRect(0,0,rw,RTH);
+  const fk = fl;
+  const gr = g.createRadialGradient(rw/2,RTH*.96,4,rw/2,RTH*.96,RTH*.75);
+  gr.addColorStop(0,`rgba(46,120,44,${.13+.07*fk})`); gr.addColorStop(1,'rgba(0,0,0,0)');
+  g.fillStyle=gr; g.fillRect(0,0,rw,RTH);
+  dust.forEach(d=>{
+    d.x += d.vx + Math.sin(t*.4+d.p)*.0006; d.y += d.vy;
+    if(d.y<0){ d.y=1; d.x=Math.random(); } if(d.x<0) d.x=1; if(d.x>1) d.x=0;
+    g.fillStyle=`rgba(200,175,130,${.2+.25*Math.sin(t*1.3+d.p)})`;
+    g.fillRect((d.x*rw)|0,(d.y*RTH)|0,1,1);
+  });
+  const by = ((t*16)%(RTH+60))-30; g.fillStyle='rgba(130,115,80,.07)'; g.fillRect(0,by,rw,12);
+  if(glitch>0) glitch--; else if(Math.random()<.012) glitch=3+((Math.random()*4)|0);
+  const jx = glitch>0 ? (Math.random()<.5?-2:2) : 0;
+  const b = .55+.45*fk, cx = rw/2, green = `rgb(${107*b|0},${255*b|0},${90*b|0})`, main = menuView==='main';
+  textBlock(g,['MICROWAVE'], cx+jx, main?RTH*.18:RTH*.05, main?26:14, green, 'center', rw, false);
+  textBlock(g,['STARING SIM'], cx, main?RTH*.18+40:RTH*.05+20, main?10:7, green, 'center', rw, false);
+  if(main){
+    MENU_ITEMS.forEach(([k,label],i)=>{
+      const p = menuHover===i ? 1 : .55+.2*Math.sin(t*2.2+i*.8);
+      textBlock(g,[`[${k.toUpperCase()}] ${label}`], cx, menuRowY(i), 12, `rgb(${255*p|0},${225*p|0},${74*p|0})`, 'center', rw, false);
+    });
+    if(netStatus) textBlock(g,[netStatus], cx, RTH*.72, 8, '#e0603a', 'center', rw, false);
+    textBlock(g,['1'+(Math.floor(t)%2===0?':':' ')+'47'], cx, RTH*.80, 9, '#3f8f3a', 'center', rw, false);
+    textBlock(g,['HEADPHONES RECOMMENDED'], cx, RTH*.91, 6, '#6a5a40', 'center', rw, false);
+  } else if(menuView==='help'){
+    textBlock(g, helpLines(), cx, RTH*.16, 8, '#cdb98a', 'center', rw, false);
+  } else if(menuView==='join'){
+    textBlock(g,['ENTER ROOM CODE'], cx, RTH*.28, 11, '#cdb98a', 'center', rw, false);
+    textBlock(g,[(joinCode+'____').slice(0,4).split('').join(' ')], cx, RTH*.40, 24, '#ffe14a', 'center', rw, false);
+    textBlock(g,[netStatus||' '], cx, RTH*.60, 9, '#e0603a', 'center', rw, false);
+    textBlock(g,['[ENTER] JOIN   [ESC] BACK'], cx, RTH*.80, 8, '#a08a60', 'center', rw, false);
+  } else if(menuView==='lobby'){
+    const host = net.role==='host', pids = host ? net.players.map(p=>p.pid) : net.lobby;
+    textBlock(g,['ROOM CODE'], cx, RTH*.22, 9, '#a08a60', 'center', rw, false);
+    textBlock(g,[net.code ? net.code.split('').join(' ') : '. . . .'], cx, RTH*.29, 26, '#ffe14a', 'center', rw, false);
+    pids.forEach((pid,i)=> textBlock(g,[`${i+1}  ${COLS[i].n}${pid===net.pid?'  (YOU)':''}`], cx, RTH*.50+i*16, 10, COLS[i].css, 'center', rw, false));
+    const line = netStatus || (host ? (pids.length>=2 ? '[ENTER] START THE MATCH' : 'WAITING FOR 1-3 MORE PLAYERS...') : 'WAITING FOR THE HOST...');
+    textBlock(g,[line], cx, RTH*.80, 8, '#cdb98a', 'center', rw, false);
+    textBlock(g,['[ESC] LEAVE'], cx, RTH*.89, 7, '#6a5a40', 'center', rw, false);
+  }
+  menuL.tx.needsUpdate = true;
+}
+let hudKey = '';
+function drawHud(rw){
+  const key = [rw, live, state, ui.msg, ui.stat, ui.prompt, net.dead, ui.board ? JSON.stringify(ui.board) : ''].join('|');
+  if(key===hudKey) return; hudKey = key;
+  const g = hudL.g; g.clearRect(0,0,rw,RTH);
+  if(live){
+    if(ui.board){
+      const b = ui.board, rows = b.rows.slice();
+      if(b.final) rows.sort((x,y)=>y.tot-x.tot);
+      textBlock(g,[b.final ? 'FINAL SCORES' : `ROUND ${b.round} OF ${b.rounds}`], rw/2, 12, 12, '#e6d6a6', 'center', rw);
+      rows.forEach((r,k)=>{
+        const pts = (r.pts>0?'+':'')+r.pts;
+        textBlock(g,[`${r.name.padEnd(6)} ${pts.padStart(4)}   TOTAL ${String(r.tot).padStart(3)}${r.me?'  <-- YOU':'         '}`], rw/2, 42+k*17, 9, COLS[r.i].css, 'center', rw);
+      });
+      if(b.final){
+        const top = Math.max(...rows.map(r=>r.tot)), w = rows.filter(r=>r.tot===top).map(r=>r.name).join(' & ');
+        textBlock(g,[`WINNER: ${w}`,'[ENTER] BACK TO MENU'], rw/2, RTH-52, 11, '#ffe14a', 'center', rw);
+      } else textBlock(g,['NEXT ROUND SOON...'], rw/2, RTH-30, 8, '#bfae82', 'center', rw);
+    } else {
+      if(state==='result' && ui.msg) textBlock(g, ui.msg.split('\n'), rw/2, RTH*.64, 11, '#e6d6a6', 'center', rw);
+      if(state==='result' && !mp) textBlock(g, ui.stat.split('\n'), rw-8, 8, 7, '#bfae82', 'right', rw);
+      if(ui.prompt && (state==='idle' || state==='result')) textBlock(g, ui.prompt.split('\n'), rw/2, RTH-34, 8, '#ffe14a', 'center', rw);
+    }
+    if(net.dead) textBlock(g,['THE HOST LEFT.','[ENTER] BACK TO MENU'], rw/2, RTH*.4, 12, '#ff8a6a', 'center', rw);
+  }
+  hudL.tx.dispose(); hudL.tx.needsUpdate = true;
+}
+
+function resize(){
+  const w = Math.max(1, innerWidth), h = Math.max(1, innerHeight);
+  renderer.setSize(w, h, false);
+  const rw = Math.min(900, Math.max(160, Math.round(RTH * w / h)));
+  hudL.c.width = menuL.c.width = rw; hudL.c.height = menuL.c.height = RTH;
+  hudKey = ''; menuL.tx.dispose(); drawMenu(rw, 0);
+  rt.setSize(rw, RTH);
+  postMat.uniforms.res.value.set(rw, RTH);
+  snapRes.value.set(rw/2, RTH/2);
+  cam.aspect = w/h;
+  cam.fov = cam.aspect < 1.4 ? 2*Math.atan(Math.tan(20*Math.PI/180)*1.4/cam.aspect)*180/Math.PI : 40;
+  cam.updateProjectionMatrix();
+}
+
+/* ---------- scene ---------- */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x050403);
+scene.fog = new THREE.Fog(0x050403, 2.2, 6);
+const cam = new THREE.PerspectiveCamera(52, 1.33, .05, 20);
+
+function patch(m){
+  m.onBeforeCompile = s => {
+    s.uniforms.uSnap = snapRes;
+    s.vertexShader = 'uniform vec2 uSnap;\n' + s.vertexShader.replace('#include <project_vertex>',
+      '#include <project_vertex>\n gl_Position.xy = floor(gl_Position.xy/gl_Position.w*uSnap+.5)/uSnap*gl_Position.w;');
+  };
+  return m;
+}
+const lam = (c,o={}) => patch(new THREE.MeshLambertMaterial(Object.assign({color:c, flatShading:true}, o)));
+const bas = (c,o={}) => patch(new THREE.MeshBasicMaterial(Object.assign({color:c}, o)));
+/* textured boxes repeat at a fixed world size (mat.userData.tile metres per repeat) instead of stretching to each face */
+function tileUV(geo,w,h,d,tile){
+  const uv=geo.attributes.uv, dims=[[d,h],[d,h],[w,d],[w,d],[w,h],[w,h]];   // px nx py ny pz nz
+  for(let f=0;f<6;f++) for(let v=0;v<4;v++){ const i=f*4+v; uv.setXY(i, uv.getX(i)*dims[f][0]/tile, uv.getY(i)*dims[f][1]/tile); }
+  uv.needsUpdate=true;
+}
+function box(w,h,d,mat,x,y,z,parent=scene){
+  const geo = new THREE.BoxGeometry(w,h,d);
+  if(mat.userData && mat.userData.tile) tileUV(geo,w,h,d,mat.userData.tile);
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(x,y,z); parent.add(m); return m;
+}
+
+const ambient = new THREE.AmbientLight(0x4a3a36, .38);
+const lamp = new THREE.PointLight(0xffd9c4, 1.0, 6); lamp.position.set(-0.5,2.3,0.6);
+const moon = new THREE.DirectionalLight(0x8fa08a, .3); moon.position.set(3,2,1);
+const dispLight = new THREE.PointLight(0x66ff66, .5, 1.3); dispLight.position.set(.17,1.15,.35);   // lives on your own microwave
+scene.add(ambient, lamp, moon);
+
+/* tiny procedural textures, nearest-filtered so they stay chunky under the pixel pass */
+function pixTex(size, repX, repY, paint){
+  const c=document.createElement('canvas'); c.width=c.height=size; const g=c.getContext('2d');
+  let seed=7; const rnd=()=>(seed=(seed*16807)%2147483647)/2147483647;
+  paint(g, size, rnd);
+  const t=new THREE.CanvasTexture(c); t.magFilter=t.minFilter=THREE.NearestFilter; t.generateMipmaps=false;
+  t.wrapS=t.wrapT=THREE.RepeatWrapping; t.repeat.set(repX,repY); return t;
+}
+const speck=(g,n,rnd,cols,s,sz=1)=>{ for(let i=0;i<n;i++){ g.fillStyle=cols[(rnd()*cols.length)|0]; g.fillRect((rnd()*s)|0,(rnd()*s)|0,sz,sz); } };
+/* blotchy multi-scale noise, the base of the grimy look */
+const mottle=(s,rnd,scales)=>{ const f=new Float32Array(s*s); let tot=0;
+  scales.forEach((k,oi)=>{ const w=1/(oi+1); tot+=w; const L=[]; for(let i=0;i<k*k;i++) L.push(rnd());
+    for(let y=0;y<s;y++) for(let x=0;x<s;x++){
+      const fx=x/s*k, fy=y/s*k, x0=Math.floor(fx), y0=Math.floor(fy), tx=fx-x0, ty=fy-y0;
+      const sx=tx*tx*(3-2*tx), sy=ty*ty*(3-2*ty);
+      const a=L[(y0%k)*k+(x0%k)], b=L[(y0%k)*k+((x0+1)%k)], c=L[((y0+1)%k)*k+(x0%k)], d=L[((y0+1)%k)*k+((x0+1)%k)];
+      const top=a+(b-a)*sx, bot=c+(d-c)*sx; f[y*s+x]+=w*(top+(bot-top)*sy);
+    } });
+  for(let i=0;i<f.length;i++) f[i]/=tot; return f; };
+const hex=h=>[parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)];
+/* paint a field through a hard-stepped colour ramp (the camo look) */
+function ramp(g,s,f,cols,shift=()=>0,contrast=2.2){
+  const img=g.createImageData(s,s), rc=cols.map(hex);
+  for(let y=0;y<s;y++) for(let x=0;x<s;x++){
+    let v=(f[y*s+x]-.5)*contrast+.5+shift(x,y); v=Math.max(0,Math.min(.999,v));
+    const c=rc[(v*rc.length)|0], i=(y*s+x)*4; img.data[i]=c[0]; img.data[i+1]=c[1]; img.data[i+2]=c[2]; img.data[i+3]=255;
+  }
+  g.putImageData(img,0,0);
+}
+/* wall: 2x2 big grimy tiles, olive stains, dark grout, drips */
+const wallTex = pixTex(64, 16, 6, (g,s,rnd)=>{
+  const f=mottle(s,rnd,[2,4,8,16]), tone=[0,0,0,0].map(()=>(rnd()-.5)*.28);
+  ramp(g,s,f,['#3a2e2e','#6d5753','#8d7268','#b09585'],(x,y)=>tone[(y>=s/2?2:0)+(x>=s/2?1:0)],3.2);
+  const o=mottle(s,rnd,[3,6]); g.fillStyle='#575640';
+  for(let y=0;y<s;y++) for(let x=0;x<s;x++) if(o[y*s+x]>.62 && ((x*7+y*13)%3)===0) g.fillRect(x,y,1,1);
+  g.fillStyle='#241a1c'; g.fillRect(0,0,s,1); g.fillRect(0,0,1,s); g.fillRect(0,s/2,s,1); g.fillRect(s/2,0,1,s);
+  g.fillStyle='#1f1618'; for(let i=0;i<5;i++) g.fillRect((rnd()*s)|0,(rnd()*s*.5)|0,1,4+((rnd()*8)|0));
+});
+/* counter top: cold grey-green slab, blotchy and pitted */
+const topTex = pixTex(64, 8, 2, (g,s,rnd)=>{
+  const f=mottle(s,rnd,[2,4,8,16,32]); ramp(g,s,f,['#26231f','#3b3832','#57534a','#7a7262']);
+  g.fillStyle='#b99a8a'; for(let i=0;i<14;i++) g.fillRect((rnd()*s)|0,(rnd()*s)|0,1,1);
+  g.fillStyle='#120e0d'; for(let i=0;i<12;i++) g.fillRect((rnd()*s)|0,(rnd()*s)|0,1+((rnd()*2)|0),1);
+});
+/* counter body: stained maroon cabinet panels */
+const bodyTex = pixTex(64, 8, 1, (g,s,rnd)=>{
+  const f=mottle(s,rnd,[2,4,8,16]); ramp(g,s,f,['#1a0f11','#2d1a1c','#472a2b','#5f3b39']);
+  g.fillStyle='#0d0708'; g.fillRect(0,0,2,s); g.fillRect(0,s-2,s,2); g.fillRect(s/2,0,1,s);
+  g.fillStyle='#6a5a4a'; g.fillRect(s/2-5,s*.45,2,6);
+});
+/* floor: checker tiles, one dark one mauve, cracked */
+const floorTex = pixTex(64, 16, 16, (g,s,rnd)=>{
+  const f=mottle(s,rnd,[2,4,8,16,32]);
+  ramp(g,s,f,['#2a1a1c','#4a2d2f','#6b4a48','#8a6c62'],(x,y)=>((x>=s/2)!==(y>=s/2))?-.22:.12);
+  g.fillStyle='#150d0e'; g.fillRect(0,0,s,1); g.fillRect(0,0,1,s); g.fillRect(0,s/2,s,1); g.fillRect(s/2,0,1,s);
+});
+const lamT = (map, tile) => { const m = lam(0xffffff,{map}); if(tile){ map.repeat.set(1,1); m.userData.tile = tile; } return m; };
+
+/* microwave wear: yellowed scratched plastic, food splatter inside, smudged glass, grimy keys */
+const shellTex = pixTex(64, 2, 2, (g,s,rnd)=>{
+  const f=mottle(s,rnd,[2,4,8,16,32]); ramp(g,s,f,['#6a6352','#7c7461','#8d8570','#9a917a'],()=>0,1.2);
+  const y=mottle(s,rnd,[3,6]); g.fillStyle='#837a52';
+  for(let i=0;i<s*s;i++){ if(y[i]>.64 && (i%6)===0) g.fillRect(i%s,(i/s)|0,1,1); }          // nicotine-yellow stains
+  g.fillStyle='#9d957f'; for(let i=0;i<4;i++){ const x=(rnd()*s)|0, yy=(rnd()*s)|0, l=5+((rnd()*10)|0); for(let k=0;k<l;k++) g.fillRect((x+k)%s,(yy+((k*.4)|0))%s,1,1); } // scratches
+  g.fillStyle='#50493a'; for(let x=0;x<s;x++){ if(rnd()<.6) g.fillRect(x,s-1-((rnd()*4)|0),1,1); } g.fillRect(0,s-1,s,1);   // grime pooling at the bottom
+  g.fillStyle='#78553c'; for(let i=0;i<3;i++) g.fillRect((rnd()*s)|0,(rnd()*s)|0,1,1);       // rust specks
+});
+const cavTex = pixTex(64, 1, 1, (g,s,rnd)=>{
+  const f=mottle(s,rnd,[2,4,8,16]); ramp(g,s,f,['#958c74','#a29980','#b0a78e','#bbb299'],()=>0,1.2);
+  const cols=['#826448','#8e6c4c','#755a40','#977452'];
+  for(let i=0;i<11;i++){ g.fillStyle=cols[(rnd()*cols.length)|0]; const x=(rnd()*s)|0, y=(rnd()*s)|0, w=1+((rnd()*4)|0), h=1+((rnd()*3)|0); g.fillRect(x,y,w,h);
+    if(rnd()<.5) g.fillRect(x+((w/2)|0),y+h,1,2+((rnd()*6)|0)); }                            // splatter + drip
+});
+const frameTex = pixTex(32, 1, 1, (g,s,rnd)=>{
+  const f=mottle(s,rnd,[2,4,8,16]); ramp(g,s,f,['#5a5546','#686250','#756e5a','#807863'],()=>0,1.2);
+  g.fillStyle='#8a826c'; for(let i=0;i<2;i++) g.fillRect((rnd()*s)|0,(rnd()*s)|0,3+((rnd()*5)|0),1);
+});
+const glassTex = pixTex(64, 1, 1, (g,s,rnd)=>{
+  g.fillStyle='#0a0c08'; g.fillRect(0,0,s,s);
+  const f=mottle(s,rnd,[3,6,12]); g.fillStyle='#1d2018';
+  for(let y=0;y<s;y++) for(let x=0;x<s;x++) if(f[y*s+x]>.68 && ((x+y)%2===0)) g.fillRect(x,y,1,1);   // fingerprints and haze
+  g.fillStyle='#292c22'; for(let i=0;i<3;i++){ const x=(rnd()*s)|0, y=(rnd()*s*.7)|0; g.fillRect(x,y,1,8+((rnd()*14)|0)); }   // streaks
+});
+const btnTex = pixTex(16, 1, 1, (g,s,rnd)=>{
+  g.fillStyle='#4c4a40'; g.fillRect(0,0,s,s); speck(g,22,rnd,['#3e3c33','#55524a','#46443b'],s);
+  g.fillStyle='#34322a'; g.fillRect(0,s-1,s,1);
+});
+
+/* kitchen shell */
+box(8,.05,8, lamT(floorTex,.5), 0,0,0);                        // floor
+box(8,3.2,.05, lamT(wallTex,.5), 0,1.6,-.38);                  // back wall
+box(6.4,.84,.66, lamT(bodyTex,.4), 0,.42,-.03);                // counter body
+box(6.4,.06,.74, lamT(topTex,.4), 0,.87,0);                    // counter top
+box(.9,.55,.34, lam(0x2a1f15), -1.15,2.05,-.2);             // upper cabinet L
+box(.9,.55,.34, lam(0x2a1f15), 1.35,2.05,-.2);              // upper cabinet R
+box(.9,.02,.4, lam(0x3a2a1c), -1.15,1.77,-.18);
+for(let i=0;i<5;i++) box(.01,.84,.01, bas(0x120d09), -1.4+i*.35,.42,.31); // drawer seams
+/* window */
+const win = box(.55,.7,.02, bas(0x7f8a72), .95,1.6,-.35);
+box(.58,.03,.04, lam(0x1a1410), .95,1.6,-.34);
+box(.03,.72,.04, lam(0x1a1410), .95,1.6,-.34);
+/* clutter: kettle, mug, bread-ish brick */
+const clutter = new THREE.Group(); scene.add(clutter);   // hidden when 3+ microwaves need the counter
+box(.12,.16,.12, lam(0x6d6a5e), -.85,1.0,-.05, clutter);
+box(.07,.09,.07, lam(0x7a2a20), .75,.95,.1, clutter);
+box(.2,.09,.1, lam(0x8b6d3a), 1.0,.95,.0, clutter);
+
+/* ---------- microwave factory: one per player ---------- */
+const shell = lamT(shellTex,.25), cav = lam(0xffffff,{map:cavTex, side:THREE.DoubleSide});
+cav.userData.tile = .3; cavTex.repeat.set(1,1);
+const btnMat = lamT(btnTex,.05), frameMat = lamT(frameTex,.15);
+const glassMat = Object.assign(bas(0xffffff,{map:glassTex,transparent:true,opacity:.68}),{userData:{tile:.3}});
+const startMat = lam(0x2c6a2c), barMat = lam(0x1c1a16), handleMat = bas(0x2b2a26);
+const plateMat = lam(0x7a8a80), bowlMat = lam(0xcfc7b0), slopMat = lam(0x9a4a22);
+
+const mwRoot = new THREE.Group(); scene.add(mwRoot);
+const mws = []; let me = 0, camBaseZ = .84;
+let door, spinner, inLight, dispPlane;      // the local player's microwave
+
+function makeMicrowave(x, col, mine){
+  const g = new THREE.Group(); g.position.x = x; mwRoot.add(g);
+  /* hollow body so the cavity can glow */
+  box(.52,.03,.4, shell, 0,.945,0, g);             // bottom
+  box(.52,.03,.4, shell, 0,1.215,0, g);            // top
+  box(.02,.24,.4, shell, -.25,1.08,0, g);          // left wall
+  box(.52,.24,.02, cav, 0,1.08,-.19, g);           // back
+  box(.18,.24,.4, shell, .17,1.08,0, g);           // control block
+  box(.32,.002,.36, cav, -.08,.962,0, g);          // cavity floor
+  box(.32,.002,.36, cav, -.08,1.198,0, g);         // cavity ceiling
+  box(.002,.24,.36, cav, .075,1.08,0, g);          // cavity right
+  /* control panel */
+  const canvas = document.createElement('canvas'); canvas.width=128; canvas.height=48;
+  const tex = new THREE.CanvasTexture(canvas); tex.minFilter = tex.magFilter = THREE.NearestFilter;
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(.13,.049), bas(0xffffff,{map:tex}));
+  plane.position.set(.17,1.15,.2015); g.add(plane);
+  for(let r=0;r<4;r++) for(let c=0;c<3;c++) box(.034,.017,.012, btnMat, .125+c*.045,1.1-r*.026,.205, g);
+  box(.06,.022,.014, startMat, .17,.99,.206, g);
+  box(.14,.006,.01, barMat, .17,1.18,.204, g);
+  box(.17,.016,.012, bas(col), .17,1.197,.206, g);          // player colour tape
+  /* door */
+  const dr = new THREE.Group(); dr.position.set(-.26,1.08,.2); g.add(dr);
+  box(.34,.035,.02, frameMat, .17,.1025,0, dr);
+  box(.34,.035,.02, frameMat, .17,-.1025,0, dr);
+  box(.035,.24,.02, frameMat, .0175,0,0, dr);
+  box(.035,.24,.02, frameMat, .3225,0,0, dr);
+  box(.014,.14,.026, handleMat, .28,0,.012, dr);
+  box(.3,.17,.012, glassMat, .17,0,0, dr);
+  /* plate + leftovers */
+  const sp = new THREE.Group(); sp.position.set(-.08,.966,0); g.add(sp);
+  sp.add(new THREE.Mesh(new THREE.CylinderGeometry(.13,.13,.008,9), plateMat));
+  const bowl = new THREE.Mesh(new THREE.CylinderGeometry(.07,.055,.055,7), bowlMat); bowl.position.y=.034; sp.add(bowl);
+  const slop = new THREE.Mesh(new THREE.IcosahedronGeometry(.062,0), slopMat); slop.scale.y=.55; slop.position.y=.062; sp.add(slop);
+  const il = new THREE.PointLight(0xffe39a, 0, 1.1); il.position.set(-.08,1.16,0); g.add(il);
+  return { g, door:dr, spinner:sp, inLight:il, mine, doorOpen:0, doorTarget:0,
+    disp:{ ctx:canvas.getContext('2d'), tex, plane, key:'' }, rs:{ phase:'idle', dur:0, startT:0, nextBeep:0 } };
+}
+const CAM_Z = [.84, 1.35, 1.85, 2.3];
+function buildLayout(n, meIdx){
+  while(mwRoot.children.length) mwRoot.remove(mwRoot.children[0]);
+  mws.length = 0;
+  for(let i=0;i<n;i++) mws.push(makeMicrowave((i-(n-1)/2)*.62, COLS[i].hex, i===meIdx));
+  me = meIdx; const L = mws[me];
+  door = L.door; spinner = L.spinner; inLight = L.inLight; dispPlane = L.disp.plane;
+  L.g.add(dispLight);
+  clutter.visible = n <= 2;
+  camBaseZ = CAM_Z[n-1];
+}
+buildLayout(1,0);
+
+/* the one standing by you */
+const fig = new THREE.Group(); fig.visible=false; scene.add(fig);
+const dark = bas(0x090604);
+box(.42,.95,.22, dark, 0,1.15,0,fig); box(.2,.24,.2, dark, 0,1.78,0,fig);
+box(.14,.8,.14, dark, -.14,.4,0,fig); box(.14,.8,.14, dark, .14,.4,0,fig);
+fig.position.set(1.05,0,.75); fig.rotation.y=-.5;
+
+/* ---------- display ---------- */
+function drawDisplay(txt, on, mw=mws[me]){
+  const d = mw.disp, key = txt+on; if(key===d.key) return; d.key = key;
+  d.ctx.fillStyle = mw.mine ? '#061406' : '#160604'; d.ctx.fillRect(0,0,128,48);
+  if(on){
+    d.ctx.fillStyle = mw.mine ? '#7dff6a' : '#ff4a2e'; d.ctx.font='bold 40px "Courier New",monospace';
+    d.ctx.textAlign='center'; d.ctx.textBaseline='middle'; d.ctx.fillText(txt,64,26);
+  }
+  d.tex.needsUpdate = true;
+}
+
+/* ---------- audio ---------- */
+let ac=null, hum=null, humGain=null, drone=null;
+function audioInit(){
+  if(ac) return;
+  try {
+    ac = new (window.AudioContext||window.webkitAudioContext)();
+    preloadSfx();
+    hum = ac.createOscillator(); hum.type='sawtooth'; hum.frequency.value=120;
+    const hl = ac.createBiquadFilter(); hl.type='lowpass'; hl.frequency.value=380;
+    humGain = ac.createGain(); humGain.gain.value=0; hum.connect(hl).connect(humGain).connect(ac.destination); hum.start();
+  } catch(e){ ac=null; }
+}
+/* loads sfx/<name>.(mp3|ogg|wav) and loops it; resolves false if no file exists */
+async function loadLoop(name, vol){
+  for(const ext of ['mp3','ogg','wav']){
+    try {
+      const r = await fetch(`sfx/${name}.${ext}`); if(!r.ok) continue;
+      const buf = await ac.decodeAudioData(await r.arrayBuffer());
+      const s = ac.createBufferSource(); s.buffer=buf; s.loop=true;
+      const g = ac.createGain(); g.gain.value=vol; s.connect(g).connect(ac.destination); s.start();
+      return true;
+    } catch(e){}
+  }
+  return false;
+}
+/* menu ambience: low sub drone plus muffled noise. starts as soon as audio is allowed, fades out on PLAY */
+let menuAmb=null;
+function menuAmbStart(){
+  if(!ac || menuAmb || phase!=='menu' || ac.state!=='running') return;
+  const out=ac.createGain(); out.gain.value=0; out.gain.linearRampToValueAtTime(1,ac.currentTime+2.5); out.connect(ac.destination);
+  const o=ac.createOscillator(); o.type='sine'; o.frequency.value=46;
+  const og=ac.createGain(); og.gain.value=.16; o.connect(og).connect(out); o.start();
+  const lfo=ac.createOscillator(), lg=ac.createGain(); lfo.frequency.value=.11; lg.gain.value=.07; lfo.connect(lg).connect(og.gain); lfo.start();
+  const len=ac.sampleRate*3, buf=ac.createBuffer(1,len,ac.sampleRate), d=buf.getChannelData(0);
+  let last=0; for(let i=0;i<len;i++){ last=(last+.02*(Math.random()*2-1))/1.02; d[i]=last*3.5; }
+  const n=ac.createBufferSource(); n.buffer=buf; n.loop=true;
+  const lp=ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=180;
+  const ng=ac.createGain(); ng.gain.value=.5; n.connect(lp).connect(ng).connect(out); n.start();
+  menuAmb={out,nodes:[o,lfo,n]};
+}
+function menuAmbStop(){
+  if(!menuAmb) return;
+  const m=menuAmb; menuAmb=null; m.out.gain.cancelScheduledValues(ac.currentTime);
+  m.out.gain.setValueAtTime(m.out.gain.value, ac.currentTime); m.out.gain.linearRampToValueAtTime(0, ac.currentTime+.9);
+  setTimeout(()=>m.nodes.forEach(x=>{ try{x.stop();}catch(e){} }), 1100);
+}
+
+/* sfx engine: sfx/manifest.json maps name -> file; anything missing falls back to the synth stand-in */
+const sfxBuf = {};
+async function preloadSfx(){
+  try {
+    const man = await (await fetch('sfx/manifest.json')).json();
+    await Promise.all(Object.entries(man).map(async ([name,file])=>{
+      try { sfxBuf[name] = await ac.decodeAudioData(await (await fetch('sfx/'+file)).arrayBuffer()); } catch(e){}
+    }));
+  } catch(e){}
+}
+function sfx(name, vol=1, fallback){
+  if(ac && sfxBuf[name]){
+    const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=sfxBuf[name]; g.gain.value=vol;
+    s.connect(g).connect(ac.destination); s.start(); return true;
+  }
+  if(fallback) fallback(); return false;
+}
+function loopStart(name, vol=1){
+  if(!ac || !sfxBuf[name]) return null;
+  const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=sfxBuf[name]; s.loop=true; g.gain.value=vol;
+  s.connect(g).connect(ac.destination); s.start(); return {s,g};
+}
+function loopStop(h){ if(!h) return; h.g.gain.setTargetAtTime(0, ac.currentTime, .05); h.s.stop(ac.currentTime+.4); }
+
+/* cook hum: plays the whole file once (start-up included), then loops its tail as overlapping
+   copies that each fade in and out, so it runs as long as the cook does. */
+let humRun=null, turntable=null;
+function humStart(){
+  const b = sfxBuf.mw_hum; if(!ac || !b) return false;
+  const L=b.duration, seg=Math.min(L*.6,4), xf=Math.min(.6,seg/3), t0=ac.currentTime+.01;
+  const master=ac.createGain(); master.gain.value=.8; master.connect(ac.destination);
+  const copy=(offset,len,at,fadeIn)=>{
+    const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=b;
+    g.gain.setValueAtTime(fadeIn?0:1,at); if(fadeIn) g.gain.linearRampToValueAtTime(1,at+xf);
+    g.gain.setValueAtTime(1,at+len-xf); g.gain.linearRampToValueAtTime(0,at+len);
+    s.connect(g).connect(master); s.start(at,offset,len);
+  };
+  copy(0,L,t0,false);
+  humRun={master, next:t0+L-xf};
+  humRun.timer=setInterval(()=>{
+    while(humRun && humRun.next < ac.currentTime+.6){ copy(L-seg,seg,humRun.next,true); humRun.next += seg-xf; }
+  },100);
+  return true;
+}
+function humStop(){
+  if(!humRun) return;
+  clearInterval(humRun.timer); humRun.master.gain.setTargetAtTime(0, ac.currentTime, .06); humRun=null;
+}
+function cookStart(){ if(!humStart()) hum_synth=true; turntable=loopStart('mw_turntable',.5); }
+function cookStop(){ humStop(); hum_synth=false; loopStop(turntable); turntable=null; }
+let hum_synth=false;
+
+/* room tone: starts with the lights; synth brown-noise drone if the file is missing */
+async function startAmbient(){
+  if(!ac) return;
+  if(await loadLoop('ambient_kitchen', .6)) return;
+  const len = ac.sampleRate*2, buf = ac.createBuffer(1,len,ac.sampleRate), d = buf.getChannelData(0);
+  let last=0; for(let i=0;i<len;i++){ last=(last+.02*(Math.random()*2-1))/1.02; d[i]=last*3.5; }
+  const n = ac.createBufferSource(); n.buffer=buf; n.loop=true;
+  const lp = ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=140;
+  drone = ac.createGain(); drone.gain.value=.5; n.connect(lp).connect(drone).connect(ac.destination); n.start();
+}
+function beep(f=2300,dur=.16,vol=.12){
+  if(!ac) return;
+  const o=ac.createOscillator(), g=ac.createGain(); o.type='square'; o.frequency.value=f;
+  g.gain.setValueAtTime(vol,ac.currentTime); g.gain.setValueAtTime(0,ac.currentTime+dur);
+  o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime+dur+.02);
+}
+function thunk(f=90,dur=.12,vol=.35){
+  if(!ac) return;
+  const o=ac.createOscillator(), g=ac.createGain(); o.type='triangle';
+  o.frequency.setValueAtTime(f,ac.currentTime); o.frequency.exponentialRampToValueAtTime(f*.5,ac.currentTime+dur);
+  g.gain.setValueAtTime(vol,ac.currentTime); g.gain.exponentialRampToValueAtTime(.001,ac.currentTime+dur);
+  o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime+dur+.02);
+}
+
+/* menu start sound: sub drop + rising noise + thunk, rendered by hand then bitcrushed
+   (sample-and-hold at ~1/8 the rate, 4-bit levels) so it sounds like a dying console */
+function menuSfx(){
+  if(!ac) return;
+  const sr=ac.sampleRate, len=Math.floor(sr*1.3), buf=ac.createBuffer(1,len,sr), d=buf.getChannelData(0);
+  const HOLD=8, LEVELS=8;
+  let ph=0, ph2=0, hold=0, nz=0;
+  for(let i=0;i<len;i++){
+    const t=i/sr;
+    const f=160*Math.pow(34/160, Math.min(1,t/.9));              // sub drop 160 -> 34hz
+    ph+=2*Math.PI*f/sr;
+    let x = Math.sin(ph) * .75 * Math.exp(-t*3.2);
+    nz = nz*.55 + (Math.random()*2-1)*.45;                       // dull noise, rising then gone
+    const nenv = t<.5 ? t/.5 : Math.max(0,1-(t-.5)/.5);
+    x += nz * .3 * nenv;
+    ph2+=2*Math.PI*(70-45*Math.min(1,t/.25))/sr;                 // thunk
+    if(t<.3) x += Math.sin(ph2) * .5 * Math.exp(-t*14);
+    if(i%HOLD===0) hold = Math.round(Math.max(-1,Math.min(1,x*1.4))*LEVELS)/LEVELS;
+    d[i]=hold;
+  }
+  const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=buf; g.gain.value=.8;
+  s.connect(g).connect(ac.destination); s.start();
+}
+
+/* light buzz: follows the flicker */
+let buzzGain=null;
+function startBuzz(){
+  if(!ac||buzzGain) return;
+  buzzGain=ac.createGain(); buzzGain.gain.value=0;
+  const lp=ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=1400;
+  [100,200,300].forEach((f,i)=>{
+    const o=ac.createOscillator(); o.type=i?'square':'sawtooth'; o.frequency.value=f+(i?Math.random()*.6:0);
+    const og=ac.createGain(); og.gain.value=[1,.35,.18][i]; o.connect(og).connect(lp); o.start();
+  });
+  lp.connect(buzzGain).connect(ac.destination);
+}
+
+/* music: tries music/track.(mp3|ogg|wav), falls back to a synth techno loop */
+let musicOn=false;
+async function startMusic(){
+  if(!ac||musicOn) return; musicOn=true;
+  for(const ext of ['mp3','ogg','wav']){
+    try {
+      const r=await fetch('music/track.'+ext); if(!r.ok) continue;
+      const buf=await ac.decodeAudioData(await r.arrayBuffer());
+      const s=ac.createBufferSource(); s.buffer=buf; s.loop=true;
+      /* heard through a wall: highs cut, lows lifted a little */
+      const g=ac.createGain(); g.gain.value=.7;
+      const lo=ac.createBiquadFilter(); lo.type='lowshelf'; lo.frequency.value=140; lo.gain.value=5;
+      const lp=ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=2200; lp.Q.value=.5;
+      s.connect(lo).connect(lp).connect(g).connect(ac.destination); s.start(); return;
+    } catch(e){}
+  }
+  synthTechno();
+}
+function synthTechno(){
+  const bpm=122, step=60/bpm/4;
+  const master=ac.createGain(); master.gain.value=.55;
+  const mlp=ac.createBiquadFilter(); mlp.type='lowpass'; mlp.frequency.value=3200;
+  master.connect(mlp).connect(ac.destination);
+  const nb=ac.createBuffer(1,ac.sampleRate,ac.sampleRate), nd=nb.getChannelData(0);
+  for(let i=0;i<nd.length;i++) nd[i]=Math.random()*2-1;
+  /* pad */
+  const pl=ac.createBiquadFilter(); pl.type='lowpass'; pl.frequency.value=500; pl.Q.value=4;
+  const pg=ac.createGain(); pg.gain.value=.07; pl.connect(pg).connect(master);
+  [110,130.8,164.8].forEach((f,i)=>[-6,6].forEach(d=>{ const o=ac.createOscillator(); o.type='sawtooth'; o.frequency.value=f; o.detune.value=d; o.connect(pl); o.start(); }));
+  const lfo=ac.createOscillator(), lg=ac.createGain(); lfo.frequency.value=.07; lg.gain.value=220; lfo.connect(lg).connect(pl.frequency); lfo.start();
+  const roots=[55,55,58.27,49];
+  function kick(t){ const o=ac.createOscillator(), g=ac.createGain(); o.frequency.setValueAtTime(150,t); o.frequency.exponentialRampToValueAtTime(42,t+.12);
+    g.gain.setValueAtTime(.95,t); g.gain.exponentialRampToValueAtTime(.001,t+.4); o.connect(g).connect(master); o.start(t); o.stop(t+.45); }
+  function hat(t,v,len){ const s=ac.createBufferSource(); s.buffer=nb; const hp=ac.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=7500;
+    const g=ac.createGain(); g.gain.setValueAtTime(v,t); g.gain.exponentialRampToValueAtTime(.001,t+len); s.connect(hp).connect(g).connect(master); s.start(t); s.stop(t+len+.02); }
+  function bass(t,f){ const o=ac.createOscillator(), lp=ac.createBiquadFilter(), g=ac.createGain(); o.type='sawtooth'; o.frequency.value=f;
+    lp.type='lowpass'; lp.frequency.setValueAtTime(420,t); lp.frequency.exponentialRampToValueAtTime(90,t+.22);
+    g.gain.setValueAtTime(.3,t); g.gain.exponentialRampToValueAtTime(.001,t+.26); o.connect(lp).connect(g).connect(master); o.start(t); o.stop(t+.3); }
+  let i=0, next=ac.currentTime+.1;
+  setInterval(()=>{
+    while(next<ac.currentTime+.2){
+      const s=i%16, bar=Math.floor(i/16)%4;
+      if(s%4===0) kick(next);
+      if(s%4===2){ hat(next,.16,.12); bass(next,roots[bar]); }
+      else if(s%2===1) hat(next,.05,.04);
+      i++; next+=step;
+    }
+  },30);
+}
+
+/* ---------- game ---------- */
+const fmt = s => Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0');
+const PRESETS = {1:15, 2:30, 3:45, 4:60, 5:107, 6:300};
+const PRESET_KEYS = Object.keys(PRESETS);
+let preset = 107, state='idle', dur=107, startT=0, beeps=0, nextBeep=0;
+let stared=0, started=false;
+let stats = { runs:0, psycho:0, stared:0, score:0, best:0 };
+try { Object.assign(stats, JSON.parse(localStorage.getItem('mw-stats')||'{}')); } catch(e){}
+const save = () => { try { localStorage.setItem('mw-stats', JSON.stringify(stats)); } catch(e){} };
+
+function remaining(now){ return Math.max(0, dur - (now-startT)/1000); }
+/* no UI while cooking: text only shows before a run (start hint) and after it (result) */
+function setPrompt(){
+  if(mp) ui.prompt = '';
+  else if(state==='idle'){
+    const it = k => `${PRESETS[k]===preset?'*':' '}[${k}] ${fmt(PRESETS[k])}`;
+    ui.prompt = `[F] START   [<] [>] TIME\n${['1','2','3','4'].map(it).join(' ')}\n${['5','6'].map(it).join(' ')}`;
+  }
+  else if(state==='result') ui.prompt = '[R] REHEAT SOMETHING ELSE';
+  else ui.prompt = '';
+}
+function setStat(){
+  ui.stat = `RUNS    ${stats.runs}\nPSYCHOS ${stats.psycho}\nSTARED  ${fmt(stats.stared)}\nSCORE   ${stats.score}`;
+}
+function applyPts(p){            // solo only: online scores are kept by the host
+  if(mp) return;
+  stats.score += p; stats.best = Math.max(stats.best, p); save(); setStat();
+}
+function startRun(forceDur){
+  if(state!=='idle' || !started) return;
+  dur = forceDur || preset; startT = performance.now(); state='running'; stared=0;
+  ui.msg='';
+  if(!sfxBuf.mw_hum) sfx('mw_start',1,()=>{ thunk(110,.1,.4); beep(1800,.08,.08); }); // the real start-up is the head of mw_hum
+  cookStart();
+  setPrompt();
+}
+function openDoor(){
+  const now = performance.now();
+  if(state==='running'){ const rem = remaining(now); finish(Math.ceil(rem), rem, false); }
+  else if(state==='done') finish(0, 0, true);
+}
+/* result lines: one pool per outcome, never the same line twice in a row */
+const LINES = {
+  psycho: [
+    () => '0:01.\nYOU ABSOLUTE PSYCHOPATH.',
+    () => 'ONE SECOND LEFT. YOU STOPPED IT.\nTHAT IS A SICKNESS.',
+    () => 'FRAME-PERFECT. NOBODY ASKED.\nNOBODY WILL CLAP.',
+    () => 'YOU CUT IT OFF AT 0:01.\nTHE MICROWAVE IS AFRAID OF YOU.',
+    () => 'THE DING NEVER CAME.\nYOU TOOK IT FROM THE MACHINE.',
+    () => 'A SINGLE SECOND SHORT.\nTHIS IS WHAT YOU TRAINED FOR.',
+    () => 'YOU WON AN ARGUMENT\nWITH A KITCHEN APPLIANCE.',
+    () => 'PERFECTLY, PATHETICALLY TIMED.\nGO OUTSIDE.',
+    () => '0:01. SILENCE. SMUG.\nTHE LEFTOVERS ARE PROUD OF NOBODY.',
+    () => 'YOU BEAT THE BEEP.\nTHE BEEP WILL REMEMBER THIS.',
+  ],
+  close: [
+    ({left}) => `${left} SECONDS LEFT.\nSO CLOSE. SO WEAK.`,
+    ({left}) => `${left} SECONDS SHORT.\nYOU FLINCHED.`,
+    ({left}) => `${left} FROM THE END.\nCOWARDICE HAS A TIMER.`,
+    ({left}) => `YOU BLINKED WITH ${left} TO GO.\nTHE MICROWAVE NOTICED.`,
+    ({left}) => `${left} MORE SECONDS.\nTHAT'S ALL YOU HAD TO DO.`,
+    ({left}) => `ALMOST. ${left} SECONDS ALMOST.\nA FAMILIAR WORD FOR YOU.`,
+    ({left}) => `THE FINISH WAS ${left} AWAY.\nYOU SAW IT. YOU LEFT.`,
+    ({left}) => `${left} SECONDS.\nTHE MIDDLE IS COLD. THE EDGES ARE SORRY.`,
+    () => 'SO CLOSE TO GREATNESS.\nSO FAR FROM IT.',
+    ({left}) => `${left} SECONDS EARLY.\nTHE FOOD IS NOT IMPRESSED.`,
+  ],
+  immediate: [
+    () => 'YOU OPENED IT IMMEDIATELY.\nTHE LEFTOVERS ARE COLD AND CONFUSED.',
+    () => 'YOU PRESSED START\nAND LEFT. WHY.',
+    () => 'THE FOOD DID NOT SEE IT COMING.\nNEITHER DID THE MICROWAVE.',
+    () => 'THAT WAS NOT A COOK.\nTHAT WAS A RUMOR.',
+    () => 'YOU STARTED IT, THEN PANICKED.\nTHE KITCHEN SAW EVERYTHING.',
+    () => 'NOTHING HAPPENED.\nTHAT IS ON YOU.',
+    () => 'COOKING TIME: BASICALLY ZERO.\nNUTRITIONAL VALUE: ALSO ZERO.',
+    () => 'YOU OPENED THE DOOR\nBEFORE THE FOOD COULD HEAR IT.',
+  ],
+  barely: [
+    ({left}) => `${left} SECONDS EARLY.\nTHE MIDDLE IS STILL COLD. IT ALWAYS IS.`,
+    () => 'THE FOOD BARELY WARMED UP.\nSO HAVE YOUR EXPECTATIONS.',
+    () => 'YOU LET IT COOK FOR A MOMENT.\nTHEN SOMETHING IN YOU BROKE.',
+    () => 'THAT WAS A TEASE,\nNOT A COOK.',
+    () => 'COLD AT THE CENTER.\nCOLD EVERYWHERE, REALLY.',
+    () => 'YOU GAVE UP VERY QUICKLY.\nTHIS IS NOTED.',
+    () => 'THE PLATE WAS STILL SPINNING.\nYOU WEREN\'T.',
+    () => 'A FEW SECONDS OF HEAT.\nNOBODY ATE WELL TONIGHT.',
+  ],
+  early: [
+    ({left}) => `${left} SECONDS EARLY.\nTHE MIDDLE IS STILL COLD. IT ALWAYS IS.`,
+    () => 'HALF-COOKED.\nJUST LIKE YOUR PLANS.',
+    ({left}) => `${left} SECONDS LEFT.\nPATIENCE IS A LOST ART.`,
+    () => 'LUKEWARM.\nTHE OFFICIAL FLAVOR OF YOUR LIFE.',
+    () => 'WARM ON THE EDGES,\nICE IN THE MIDDLE. LIKE YOU.',
+    () => 'YOU STOPPED IN THE MIDDLE.\nEVERYONE DOES.',
+    () => 'THE COOK WAS NOT FINISHED.\nNEITHER WERE YOU.',
+    () => 'A BOLD DECISION.\nTHE FOOD DISAGREES.',
+  ],
+  almost: [
+    ({left}) => `${left} SECONDS FROM DONE.\nYOU COULD HAVE HELD ON.`,
+    () => 'ALMOST HOT.\nALMOST BRAVE.',
+    ({left}) => `${left} SECONDS SHORT OF HOT.\nA LIFETIME OF NEAR MISSES.`,
+    () => 'THE FINISH LINE WAS RIGHT THERE.\nYOU TURNED AROUND.',
+    () => 'TECHNICALLY WARM.\nSPIRITUALLY UNFINISHED.',
+    () => 'SO MUCH WAITING FOR THIS.\nYOU OPENED THE DOOR.',
+    ({left}) => `${left} MORE SECONDS.\nYOU WILL THINK ABOUT THIS.`,
+    () => 'HOT ON THE OUTSIDE.\nYOU, TOO, IT SEEMS.',
+  ],
+  quick: [
+    () => 'IT STARTED BEEPING. YOU CAME RUNNING.\nOBEDIENT.',
+    () => 'THE BEEP BARELY BEGAN.\nYOU WERE ALREADY THERE.',
+    () => 'YOU HEARD THE FIRST BEEP\nAND SALUTED.',
+    () => 'A GOOD LITTLE DINNER GUEST.\nTRAINED BY A BEEP.',
+    () => 'YOU WAITED FOR THE DING.\nJUST LIKE YOU WERE TOLD.',
+    () => 'PUNCTUAL. UNIMAGINATIVE.\nTHE FOOD IS HOT.',
+    () => 'THE MACHINE CALLED.\nYOU ANSWERED.',
+    () => 'COOKED. SERVED.\nNO ONE IS SURPRISED.',
+    () => 'DONE BEEPING.\nDONE THINKING.',
+    () => 'THE FOOD IS READY.\nSO WAS YOUR EXCUSE.',
+  ],
+  late: [
+    ({n}) => `IT BEEPED ${n} TIMES.\nYOU WATCHED. IT WATCHED BACK.`,
+    ({n}) => `${n} BEEPS.\nYOU STARED INTO THE LIGHT.`,
+    ({n}) => `${n} BEEPS BEFORE YOU MOVED.\nWHAT WERE YOU DOING.`,
+    ({n}) => `THE ALARM RANG ${n} TIMES.\nYOU HAD YOUR REASONS.`,
+    () => 'YOU HEARD IT.\nYOU JUST DID NOT CARE.',
+    ({n}) => `${n} BEEPS LATER,\nTHE FOOD IS HOT AND DISAPPOINTED.`,
+    () => 'YOU LET IT YELL AT YOU.\nIT HAS FEELINGS TOO.',
+    () => 'A LONG, STARING PAUSE.\nTHEN THE DOOR.',
+  ],
+  ghost: [
+    ({n}) => `${n} BEEPS.\nYOU ARE WATCHING A MICROWAVE FEEL ALONE.`,
+    ({n}) => `IT BEEPED ${n} TIMES.\nTHE FOOD IS COLD AGAIN.`,
+    () => 'YOU LET IT BEEP FOR AGES.\nNOBODY IS COMING FOR YOU.',
+    ({n}) => `${n} BEEPS.\nTHE MACHINE IS BEGGING.`,
+    () => 'THE FOOD GREW COLD.\nYOU GREW STRANGE.',
+    () => 'YOU WERE THERE THE WHOLE TIME.\nTHAT IS THE SCARIEST PART.',
+    ({n}) => `${n} BEEPS OF PURE NOTHING.\nWELL DONE.`,
+    () => 'IT BEEPED UNTIL IT COULD NOT.\nYOU STILL DID NOT MOVE.',
+    () => 'THE MICROWAVE SCREAMED.\nYOU DID NOT FLINCH.',
+    () => 'SOMETHING STOOD BEHIND YOU.\nYOU DID NOT TURN AROUND.',
+  ],
+};
+const lastLine = {};
+function pick(cat, args){
+  const pool = LINES[cat]; let i;
+  do { i = (Math.random()*pool.length)|0; } while(pool.length>1 && i===lastLine[cat]);
+  lastLine[cat] = i; return pool[i](args);
+}
+function finish(leftDisp, rem, wasDone){
+  state='result'; mws[me].doorTarget=1; cookStop();
+  if(!(wasDone && sfxBuf.mw_end)) sfx('mw_door_open',1,()=>thunk(70,.2,.45)); // after the alarm, the door sound is inside mw_end
+  if(!mp){ stats.runs++; stats.stared += Math.round(stared); }
+  let pts, m;
+  if(wasDone){ pts = END_PENALTY; emitEv('door',0,0); }          // the -5 was applied when the timer hit zero
+  else { pts = pointsFor(rem); applyPts(pts); emitEv('open',pts,rem); }
+  if(!wasDone){
+    const elapsed = 1 - leftDisp/dur;
+    if(leftDisp===1){ if(!mp) stats.psycho++; m = pick('psycho', {left:leftDisp}); }
+    else if(leftDisp<=3) m = pick('close', {left:leftDisp});
+    else if(leftDisp>=dur-2) m = pick('immediate', {left:leftDisp});
+    else if(elapsed<.25) m = pick('barely', {left:leftDisp});
+    else if(elapsed>.75) m = pick('almost', {left:leftDisp});
+    else m = pick('early', {left:leftDisp});
+  } else {
+    const per = sfxBuf.mw_end ? 4 : sfxBuf.mw_ding ? 3 : 1;
+    const n = beeps*per;
+    if(beeps<=1) m = pick('quick', {n});
+    else if(beeps<=3) m = pick('late', {n});
+    else m = pick('ghost', {n});
+  }
+  ui.msg = m + `\n${pts>0?'+':''}${pts} POINTS`;
+  save(); setStat(); setPrompt();
+  setTimeout(()=>sfx(!wasDone && leftDisp===1 ? 'result_psychopath' : 'result_weak', .9), 600);
+}
+function reset(){
+  if(state!=='result' || mp) return;
+  mws[me].doorTarget=0; state='idle'; ui.msg=''; sfx('mw_door_close',1,()=>thunk(80,.18,.4));
+  spinner.rotation.y=0; setPrompt();
+}
+
+/* ---------- online: PeerJS (WebRTC data channels), star around the host ---------- */
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+const randCode = () => Array.from({length:4},()=>CODE_CHARS[(Math.random()*CODE_CHARS.length)|0]).join('');
+const peerOK = () => typeof Peer !== 'undefined';
+const sendTo = (c,m) => { try{ if(c && c.open) c.send(m); }catch(e){} };
+const broadcast = (m, except) => net.conns.forEach(c=>{ if(c!==except) sendTo(c,m); });
+
+function leaveRoom(){
+  try{ clearTimeout(net.roundTimer); net.peer && net.peer.destroy(); }catch(e){}
+  Object.assign(net, { role:null, peer:null, conns:[], hostConn:null, pid:null, code:'', players:[], lobby:[], started:false, nextId:0 });
+  netStatus=''; menuView='main';
+}
+function lobbyBroadcast(){ const pids = net.players.map(p=>p.pid); net.lobby = pids; broadcast({t:'lobby', pids}); }
+
+function hostRoom(tries=0){
+  if(!peerOK()){ netStatus='NO NETWORK (CANNOT LOAD PEERJS)'; return; }
+  net.code = randCode(); net.role='host'; net.pid='p0'; net.players=[{pid:'p0',conn:null}]; net.conns=[]; net.started=false;
+  netStatus='OPENING ROOM...'; menuView='lobby';
+  const peer = new Peer('mwsim-'+net.code); net.peer = peer;
+  peer.on('open', ()=>{ netStatus=''; });
+  peer.on('error', e=>{
+    if(e.type==='unavailable-id' && tries<5){ try{peer.destroy();}catch(_){} hostRoom(tries+1); }
+    else { netStatus='ERROR: '+String(e.type).toUpperCase(); }
+  });
+  peer.on('connection', c=>{
+    c.on('open', ()=>{
+      if(net.started || net.players.length>=4){ sendTo(c,{t:'full'}); setTimeout(()=>{ try{c.close();}catch(_){} },300); return; }
+      const pid = 'p'+(++net.nextId); c.__pid = pid; net.conns.push(c); net.players.push({pid, conn:c});
+      sendTo(c,{t:'welcome', pid}); lobbyBroadcast();
+    });
+    c.on('data', m=>hostOnData(c,m));
+    c.on('close', ()=>hostPeerLeft(c)); c.on('error', ()=>hostPeerLeft(c));
+  });
+}
+function hostPeerLeft(c){
+  const pid = c.__pid; if(!pid || c.__left) return; c.__left = true;
+  net.conns = net.conns.filter(x=>x!==c);
+  if(!net.started){ net.players = net.players.filter(p=>p.pid!==pid); lobbyBroadcast(); return; }
+  net.resolved[pid] = true; if(net.rpts[pid]===undefined) net.rpts[pid]=0;
+  broadcast({t:'gone', pid}); markGone(pid); checkRoundEnd();
+}
+function hostOnData(c,m){
+  if(!m || m.t!=='ev') return;
+  m.pid = c.__pid; hostBook(m); onEvVisual(m); broadcast(m, c);      // relay to everyone else
+}
+function hostStart(){
+  if(net.role!=='host' || net.players.length<2 || net.started) return;
+  net.started = true; net.order = net.players.map(p=>p.pid); net.rounds = 5; net.round = 0; net.tot = {};
+  broadcast({t:'start', order:net.order, rounds:net.rounds});
+  startMatch();
+}
+function joinRoom(code){
+  if(!peerOK()){ netStatus='NO NETWORK (CANNOT LOAD PEERJS)'; return; }
+  net.role='client'; netStatus='CONNECTING...';
+  const peer = new Peer(); net.peer = peer;
+  const fail = s => { netStatus=s; try{peer.destroy();}catch(_){} net.role=null; net.peer=null; };
+  const to = setTimeout(()=>{ if(menuView==='join') fail('COULD NOT CONNECT'); }, 15000);
+  peer.on('error', e=>{ clearTimeout(to); fail(e.type==='peer-unavailable' ? 'NO SUCH ROOM' : 'ERROR: '+String(e.type).toUpperCase()); });
+  peer.on('open', ()=>{
+    const c = peer.connect('mwsim-'+code, {reliable:true}); net.hostConn = c;
+    c.on('open', ()=>{ clearTimeout(to); netStatus=''; menuView='lobby'; net.code=code; });
+    c.on('data', clientOnData);
+    c.on('close', hostLeft); c.on('error', ()=>{});
+  });
+}
+function hostLeft(){
+  if(net.started){ net.dead = true; return; }
+  const was = menuView; leaveRoom(); menuView='main'; if(was==='lobby') netStatus='THE HOST LEFT';
+}
+function clientOnData(m){
+  if(!m) return;
+  if(m.t==='welcome') net.pid = m.pid;
+  else if(m.t==='lobby') net.lobby = m.pids;
+  else if(m.t==='full'){ netStatus='ROOM IS FULL'; menuView='join'; try{net.peer.destroy();}catch(e){} net.role=null; }
+  else if(m.t==='start'){ net.order=m.order; net.rounds=m.rounds; net.started=true; net.tot={}; startMatch(); }
+  else if(m.t==='round') beginRound(m);
+  else if(m.t==='ev') onEvVisual(m);
+  else if(m.t==='rend') onRend(m);
+  else if(m.t==='gone') markGone(m.pid);
+}
+/* local result -> everyone else (and the host's books) */
+function emitEv(k, pts, rem){
+  if(!mp) return;
+  const m = { t:'ev', pid:net.pid, k, pts, rem };
+  if(net.role==='host'){ hostBook(m); broadcast(m); } else sendTo(net.hostConn, m);
+}
+function hostBook(m){
+  if((m.k==='open' || m.k==='end') && !net.resolved[m.pid]){ net.resolved[m.pid]=true; net.rpts[m.pid]=m.pts; checkRoundEnd(); }
+}
+/* what the other microwaves do on your screen */
+function onEvVisual(m){
+  const i = net.order.indexOf(m.pid); if(i<0 || i===me || !mws[i]) return;
+  const mw = mws[i];
+  if(m.k==='open' || m.k==='door'){ mw.rs.phase='opened'; mw.doorTarget=1; thunk(70,.15,.12); }
+  else if(m.k==='end' && mw.rs.phase!=='opened'){ mw.rs.phase='ended'; }
+}
+function markGone(pid){
+  const i = net.order.indexOf(pid); if(i<0 || i===me || !mws[i]) return;
+  mws[i].rs.phase='gone'; mws[i].doorTarget=1;
+}
+function startMatch(){
+  mp = { n:net.order.length, me:net.order.indexOf(net.pid) };
+  buildLayout(mp.n, mp.me);
+  play();
+}
+function hostNextRound(){
+  if(net.role!=='host' || net.dead) return;
+  net.round++; net.resolved={}; net.rpts={}; net.ending=false;
+  const durs = {}, used = [];
+  net.order.forEach(pid=>{
+    let d, guard=0;
+    do { d = 15 + ((Math.random()*61)|0); guard++; } while(used.some(u=>Math.abs(u-d)<4) && guard<60);
+    used.push(d); durs[pid]=d;
+  });
+  const m = { t:'round', n:net.round, rounds:net.rounds, durs };
+  broadcast(m); beginRound(m);
+}
+function beginRound(m){
+  net.round = m.n; net.rounds = m.rounds;
+  ui.board = null; ui.msg = '';
+  net.order.forEach((pid,i)=>{
+    const mw = mws[i]; mw.doorTarget=0; mw.spinner.rotation.y=0;
+    mw.rs = { phase:'run', dur:m.durs[pid], startT:performance.now(), nextBeep:0 };
+  });
+  cookStop(); state='idle'; started=true;
+  startRun(m.durs[net.pid]);
+}
+function checkRoundEnd(){
+  if(net.ending || !net.order.every(pid=>net.resolved[pid])) return;
+  net.ending = true; clearTimeout(net.roundTimer); net.roundTimer = setTimeout(hostRoundEnd, 2200);
+}
+function hostRoundEnd(){
+  const pts = {};
+  net.order.forEach(pid=>{ pts[pid] = net.rpts[pid]||0; net.tot[pid] = (net.tot[pid]||0) + pts[pid]; });
+  const final = net.round >= net.rounds;
+  const m = { t:'rend', n:net.round, rounds:net.rounds, pts, tot:{...net.tot}, final };
+  broadcast(m); onRend(m);
+  if(!final) net.roundTimer = setTimeout(hostNextRound, 9000);
+}
+function onRend(m){
+  mws.forEach(mw=>{ mw.doorTarget=1; });
+  if(state==='running' || state==='done'){ cookStop(); }
+  state='result'; ui.msg='';
+  ui.board = { round:m.n, rounds:m.rounds, final:m.final,
+    rows: net.order.map((pid,i)=>({ i, name:COLS[i].n, pts:m.pts[pid]||0, tot:m.tot[pid]||0, me:i===me })) };
+}
+
+/* ---------- input ---------- */
+function menuAction(k){
+  if(k==='p') startSolo();
+  else if(k==='h') hostRoom();
+  else if(k==='j'){ menuView='join'; joinCode=''; netStatus=''; }
+  else if(k==='i') menuView='help';
+}
+function menuKey(e, k){
+  if(menuView==='main'){
+    if(k==='enter' || k===' ' || k==='p'){ e.preventDefault(); menuAction('p'); }
+    else if(k==='h' || k==='j' || k==='i') menuAction(k);
+  } else if(menuView==='help'){
+    if(k==='escape' || k==='enter' || k==='backspace') menuView='main';
+  } else if(menuView==='join'){
+    if(k==='escape'){ menuView='main'; netStatus=''; }
+    else if(k==='backspace') joinCode = joinCode.slice(0,-1);
+    else if(k==='enter'){ if(joinCode.length===4) joinRoom(joinCode); }
+    else if(/^[a-z]$/.test(k) && joinCode.length<4) joinCode += k.toUpperCase();
+  } else if(menuView==='lobby'){
+    if(k==='escape') leaveRoom();
+    else if(k==='enter') hostStart();
+  }
+}
+addEventListener('keydown', e=>{
+  const k = e.key.toLowerCase();
+  if(phase==='menu'){ if(ac) ac.resume().then(menuAmbStart); menuKey(e,k); return; }
+  if(!started) return;
+  if(mp){
+    if(k==='e' || k===' '){ e.preventDefault(); openDoor(); }
+    else if(k==='enter' && ((ui.board && ui.board.final) || net.dead)) location.reload();
+    return;
+  }
+  if(k==='f'||k==='enter') startRun();
+  else if(k==='e'||k===' ') { e.preventDefault(); openDoor(); }
+  else if(k==='r') reset();
+  else if(state==='idle' && (PRESETS[k] || k==='arrowleft' || k==='arrowright' || k==='a' || k==='d')){
+    if(PRESETS[k]) preset=PRESETS[k];
+    else { const i=PRESET_KEYS.findIndex(q=>PRESETS[q]===preset), n=PRESET_KEYS.length, dir=(k==='arrowleft'||k==='a')?-1:1;
+           preset=PRESETS[PRESET_KEYS[(i+dir+n)%n]]; }
+    setPrompt(); sfx('mw_key',.8,()=>thunk(140,.05,.2));
+  }
+});
+addEventListener('pointerdown', e=>{
+  if(phase==='menu'){
+    const y = e.clientY/innerHeight*RTH;
+    if(menuView==='main'){ const i = menuRowAt(y); if(i>=0){ if(ac) ac.resume().then(menuAmbStart); menuAction(MENU_ITEMS[i][0]); } }
+    else if(menuView==='help') menuView='main';
+    else if(menuView==='lobby' && y>RTH*.76 && y<RTH*.86) hostStart();
+    return;
+  }
+  if(!started) return;
+  if(mp){
+    if((ui.board && ui.board.final) || net.dead) location.reload();
+    else openDoor();
+    return;
+  }
+  if(state==='idle') startRun(); else if(state==='running'||state==='done') openDoor(); else reset();
+});
+let mx=0,my=0;
+addEventListener('pointermove', e=>{
+  mx=e.clientX/innerWidth*2-1; my=e.clientY/innerHeight*2-1;
+  menuHover = (phase==='menu' && menuView==='main') ? menuRowAt(e.clientY/innerHeight*RTH) : -1;
+  document.body.style.cursor = menuHover>=0 ? 'pointer' : 'default';
+});
+addEventListener('beforeunload', ()=>{ try{ net.peer && net.peer.destroy(); }catch(e){} });
+
+/* menu -> dissolve (1s) -> black (4s) -> lights, buzz and music slam in */
+let live=false, liveAt=0, phase='menu', dissolveAt=0;
+function startSolo(){ mp=null; buildLayout(1,0); setPrompt(); setStat(); play(); }
+function play(){
+  if(phase!=='menu') return;
+  phase='dissolve'; dissolveAt=performance.now(); audioInit(); if(ac&&ac.state==='suspended') ac.resume();
+  menuAmbStop(); menuSfx();
+  setTimeout(()=>{ phase='black'; }, 1000);
+  setTimeout(()=>{
+    phase='live'; live=true; liveAt=performance.now(); started=true;
+    startMusic(); startAmbient(); startBuzz();
+    if(mp && net.role==='host') setTimeout(hostNextRound, 1800);
+  }, 5000); // 1s dissolve + 4s of black
+}
+
+/* creep events */
+let creepAt = performance.now()+ 15000 + Math.random()*20000, creep=null;
+let fridgeAt = performance.now()+ 40000, fridgeOn=false;
+
+setPrompt(); setStat(); resize(); addEventListener('resize', resize);
+audioInit(); if(ac) ac.onstatechange=()=>menuAmbStart(); menuAmbStart();
+if(QUIET){
+  window.__mw = { net, mws, get mp(){return mp}, get state(){return state}, get phase(){return phase}, get menuView(){return menuView},
+    get netStatus(){return netStatus}, key:k=>dispatchEvent(new KeyboardEvent('keydown',{key:k})), hostRoom, joinRoom, hostStart };
+  if(!/[?&]menu/.test(location.search)) startSolo();
+}
+
+/* ---------- loop ---------- */
+let prev = performance.now(), progressSmooth=0;
+function frame(now){
+  requestAnimationFrame(frame);
+  const dt = Math.min(.1,(now-prev)/1000); prev=now;
+  const t = now/1000;
+  const L = mws[me];
+
+  let progress = 0;
+  if(state==='running'){
+    const rem = remaining(now);
+    stared += dt;
+    progress = 1 - rem/dur;
+    drawDisplay(fmt(Math.ceil(rem)), true, L);
+    spinner.rotation.y += dt*.9;
+    if(rem<=0){ state='done'; beeps=0; nextBeep=now; cookStop(); applyPts(END_PENALTY); emitEv('end',END_PENALTY,0); setPrompt(); }
+    else if(Math.random() < dt*.4) sfx('food_pop', .5);
+  } else if(state==='done'){
+    progress = 1; stared += dt;
+    drawDisplay('0:00', Math.floor(t*2)%2===0, L);
+    if(now>=nextBeep){
+      beeps++;
+      if(sfxBuf.mw_end){ sfx('mw_end',1); nextBeep=now+8000; }
+      else if(sfxBuf.mw_ding){ [0,850,1700].forEach(d=>setTimeout(()=>sfx('mw_ding',.9),d)); nextBeep=now+5200; }
+      else { beep(2300,.14,.12); setTimeout(()=>beep(2300,.14,.12),220); setTimeout(()=>beep(2300,.14,.12),440); nextBeep=now+3200; }
+    }
+  } else if(state==='idle'){
+    drawDisplay(mp ? '--:--' : fmt(preset), true, L);
+  } else {
+    drawDisplay('--:--', Math.floor(t*1.5)%2===0, L);
+  }
+  progressSmooth += (progress-progressSmooth)*Math.min(1,dt*2);
+
+  /* every microwave: other players' timers, doors, interior light */
+  mws.forEach((mw,i)=>{
+    const mine = i===me, rs = mw.rs;
+    if(!mine){
+      if(rs.phase==='run'){
+        const rem = Math.max(0, rs.dur-(now-rs.startT)/1000);
+        drawDisplay(fmt(Math.ceil(rem)), true, mw); mw.spinner.rotation.y += dt*.9;
+        if(rem<=0){ rs.phase='ended'; rs.nextBeep=now; }
+      } else if(rs.phase==='ended'){
+        drawDisplay('0:00', Math.floor(t*2)%2===0, mw);
+        if(now>=rs.nextBeep){ rs.nextBeep=now+5200; beep(2000,.12,.03); }
+      } else if(rs.phase==='opened' || rs.phase==='gone') drawDisplay('--:--', false, mw);
+      else drawDisplay('--:--', true, mw);
+    }
+    mw.doorOpen += (mw.doorTarget-mw.doorOpen)*Math.min(1,dt*7);
+    mw.door.rotation.y = -1.95*mw.doorOpen;
+    const lit = mine ? (state==='running'||state==='done') : (rs.phase==='run'||rs.phase==='ended');
+    const flick = (mine ? state==='running' : rs.phase==='run') ? (.9 + Math.random()*.15) : 1;
+    const want = mw.doorTarget>0 ? .7 : (lit ? 1.35*flick : 0);
+    mw.inLight.intensity += (want - mw.inLight.intensity)*Math.min(1,dt*10);
+  });
+  if(humGain) humGain.gain.value += ((state==='running' && !sfxBuf.mw_hum ? .09:0)-humGain.gain.value)*Math.min(1,dt*8);
+  if(hum) hum.frequency.value = 118 + (state==='running'? Math.sin(t*3)*1.5 : 0);
+
+  /* creep: flicker, silhouette */
+  if(!creep && now>creepAt && live){
+    creep={t0:now, fig:Math.random()<.4}; sfx('light_flicker',.8);
+    if(creep.fig) setTimeout(()=>sfx('creep_stinger',1),550);
+  }
+  if(live && now>fridgeAt){ fridgeOn=!fridgeOn; sfx(fridgeOn?'fridge_compressor_on':'fridge_compressor_off',.7); fridgeAt=now+30000+Math.random()*50000; }
+  let lightMul=1;
+  if(creep){
+    const e=(now-creep.t0)/1000;
+    if(e<.55){ lightMul = Math.random()<.5? .05 : 1; fig.visible = creep.fig && lightMul<.5; }
+    else if(creep.fig && e<2.4){ fig.visible=true; lightMul=.85; }
+    else { fig.visible=false; creep=null; creepAt = now+ 20000 + Math.random()*35000; }
+  }
+  /* steady flicker: new target every 30-130ms, occasional deep dip; startup stutters */
+  flickNext -= dt;
+  if(flickNext<=0){ flickNext=.03+Math.random()*.1; flickTarget = Math.random()<.12 ? .22+Math.random()*.28 : .78+Math.random()*.22; }
+  fl += (flickTarget-fl)*Math.min(1,dt*30);
+  let flEff = 0;
+  if(live){
+    const boot = Math.min(1,(now-liveAt)/1400);
+    flEff = fl * (Math.random()<boot ? 1 : .04);
+  }
+  const lm = lightMul*flEff;
+  ambient.intensity = .38*lm; lamp.intensity = 1.0*lm; moon.intensity = .3*lm;
+  dispLight.intensity = live ? .5*(.75+.25*flEff) : 0;
+  if(live) mws.forEach(mw=>mw.disp.plane.material.color.setScalar(.8+.2*flEff));
+  if(buzzGain) buzzGain.gain.value = .008 + .03*flEff + (flEff<.5 ? .02 : 0);
+
+  /* camera: sway and parallax; pulls back to fit every player's microwave */
+  /* pull back until the whole row of microwaves fits the window, whatever its shape */
+  const fitZ = mws.length>1 ? ((mws.length-1)*.62+.95) / (2*Math.tan(cam.fov*Math.PI/360)*cam.aspect) : 0;
+  const camZ = Math.max(camBaseZ, fitZ) - (mp ? 0 : .04*progressSmooth);
+  cam.position.set(mx*.06 + Math.sin(t*.31)*.008, 1.14 + Math.sin(t*.47)*.005 - my*.02, camZ);
+  cam.lookAt(.02 + mx*.03, 1.08 - my*.015, 0);
+
+  postMat.uniforms.time.value = t;
+  postMat.uniforms.mA.value = phase==='menu' ? 1 : phase==='dissolve' ? Math.max(0,1-(now-dissolveAt)/1000) : 0;
+  postMat.uniforms.blk.value = phase==='live' ? 0 : 1;
+  if(phase==='menu'||phase==='dissolve') drawMenu(rt.width, t);
+  drawHud(rt.width);
+  renderer.setRenderTarget(rt); renderer.render(scene, cam);
+  renderer.setRenderTarget(null); renderer.render(post, postCam);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
