@@ -92,7 +92,7 @@ const mkLayer = () => { const c=document.createElement('canvas'); const tx=new T
   tx.minFilter=tx.magFilter=THREE.NearestFilter; tx.generateMipmaps=false; return {c, g:c.getContext('2d'), tx}; };
 const hudL = mkLayer(), menuL = mkLayer();
 postMat.uniforms.hud.value = hudL.tx; postMat.uniforms.menu.value = menuL.tx;
-const ui = { prompt:'', stat:'', msg:'', board:null };
+const ui = { prompt:'', stat:'', msg:'', board:null, toast:'' };
 const FONT = 'ui-monospace,"Courier New",monospace';
 
 /* draws a block of lines on a dark plate; shrinks the font until it fits */
@@ -131,8 +131,10 @@ const MENU_ITEMS = [['p','SOLO'],['h','HOST A ROOM'],['j','JOIN A ROOM'],['i','H
 const menuRowY = i => RTH*.46 + i*19;
 const menuRowAt = y => { const i = Math.round((y-RTH*.46)/19); return (i>=0 && i<MENU_ITEMS.length && Math.abs(y-menuRowY(i))<10) ? i : -1; };
 /* settings screen: the player's own music, kept in this browser only */
+let musicMode = (()=>{ try{ return localStorage.getItem('mw-music-mode')==='legacy' ? 'legacy' : 'new'; }catch(e){ return 'new'; } })();   // which built-in synth
+let randomTime = (()=>{ try{ return localStorage.getItem('mw-random-time')!=='off'; }catch(e){ return true; } })();   // solo: random 15s-3min unless switched off
 let customInfo = null, settingsMsg = '';              // customInfo: { name, bpm } once a track is saved
-const SETTINGS_ROWS = [['u',.40],['c',.50],['escape',.89]];
+const SETTINGS_ROWS = [['u',.34],['c',.43],['l',.52],['t',.61],['escape',.91]];
 const settingsRowAt = y => { for(const [k,f] of SETTINGS_ROWS) if(Math.abs(y-RTH*f)<10) return k; return null; };
 
 /* scoring: seconds away from the end -> points, linear between anchors. letting it end costs points. */
@@ -190,13 +192,15 @@ function drawMenu(rw, t){
     textBlock(g, helpLines(), cx, RTH*.16, 8, '#cdb98a', 'center', rw, false);
   } else if(menuView==='settings'){
     const cur = customInfo ? `${customInfo.name.length>26 ? customInfo.name.slice(0,25)+'~' : customInfo.name}  (${customInfo.bpm} BPM)` : 'BUILT-IN TRACK';
-    textBlock(g,['MUSIC'], cx, RTH*.22, 9, '#a08a60', 'center', rw, false);
-    textBlock(g,[cur.toUpperCase()], cx, RTH*.29, 9, '#cdb98a', 'center', rw, false);
-    textBlock(g,['[U] LOAD YOUR OWN TRACK'], cx, RTH*.40, 10, '#ffe14a', 'center', rw, false);
-    textBlock(g,[customInfo ? '[C] BACK TO THE BUILT-IN TRACK' : ' '], cx, RTH*.50, 10, '#ffe14a', 'center', rw, false);
-    textBlock(g,[settingsMsg||' '], cx, RTH*.62, 9, /COULD NOT|TOO BIG/.test(settingsMsg) ? '#e0603a' : '#78ff88', 'center', rw, false);
-    textBlock(g,['MP3 / WAV / OGG / M4A, 40 MB MAX.','STAYS IN THIS BROWSER. NOTHING IS UPLOADED.','THE LIGHTS LOCK TO ITS TEMPO.'], cx, RTH*.72, 7, '#6a5a40', 'center', rw, false);
-    textBlock(g,['[ESC] BACK'], cx, RTH*.89, 8, '#a08a60', 'center', rw, false);
+    textBlock(g,['MUSIC'], cx, RTH*.19, 9, '#a08a60', 'center', rw, false);
+    textBlock(g,[cur.toUpperCase()], cx, RTH*.25, 9, '#cdb98a', 'center', rw, false);
+    textBlock(g,['[U] LOAD YOUR OWN TRACK'], cx, RTH*.34, 10, '#ffe14a', 'center', rw, false);
+    textBlock(g,[customInfo ? '[C] BACK TO THE BUILT-IN TRACK' : ' '], cx, RTH*.43, 10, '#ffe14a', 'center', rw, false);
+    textBlock(g,[`[L] BUILT-IN SYNTH: ${musicMode==='legacy' ? 'LEGACY' : 'NEW'}`], cx, RTH*.52, 10, '#ffe14a', 'center', rw, false);
+    textBlock(g,[`[T] SOLO TIMER: ${randomTime ? 'RANDOM 0:15-3:00' : 'YOUR CHOICE'}`], cx, RTH*.61, 10, '#ffe14a', 'center', rw, false);
+    textBlock(g,[settingsMsg||' '], cx, RTH*.69, 9, /COULD NOT|TOO BIG/.test(settingsMsg) ? '#e0603a' : '#78ff88', 'center', rw, false);
+    textBlock(g,['MP3 / WAV / OGG / M4A, 40 MB MAX.','STAYS IN THIS BROWSER. NOTHING IS UPLOADED.','THE LIGHTS LOCK TO ITS TEMPO.'], cx, RTH*.77, 7, '#6a5a40', 'center', rw, false);
+    textBlock(g,['[ESC] BACK'], cx, RTH*.91, 8, '#a08a60', 'center', rw, false);
   } else if(menuView==='join'){
     textBlock(g,['ENTER ROOM CODE'], cx, RTH*.28, 11, '#cdb98a', 'center', rw, false);
     textBlock(g,[(joinCode+'____').slice(0,4).split('').join(' ')], cx, RTH*.40, 24, '#ffe14a', 'center', rw, false);
@@ -215,7 +219,7 @@ function drawMenu(rw, t){
 }
 let hudKey = '';
 function drawHud(rw){
-  const key = [rw, live, state, ui.msg, ui.stat, ui.prompt, net.dead, ui.board ? JSON.stringify(ui.board) : ''].join('|');
+  const key = [rw, live, state, ui.msg, ui.stat, ui.prompt, ui.toast, net.dead, ui.board ? JSON.stringify(ui.board) : ''].join('|');
   if(key===hudKey) return; hudKey = key;
   const g = hudL.g; g.clearRect(0,0,rw,RTH);
   if(live){
@@ -234,8 +238,9 @@ function drawHud(rw){
     } else {
       if(state==='result' && ui.msg) textBlock(g, ui.msg.split('\n'), rw/2, RTH*.64, 11, '#e6d6a6', 'center', rw);
       if(state==='result' && !mp) textBlock(g, ui.stat.split('\n'), rw-8, 8, 7, '#bfae82', 'right', rw);
-      if(ui.prompt && (state==='idle' || state==='result')) textBlock(g, ui.prompt.split('\n'), rw/2, RTH-34, 8, '#ffe14a', 'center', rw);
+      if(ui.prompt && (state==='idle' || state==='result')){ const pl = ui.prompt.split('\n'); textBlock(g, pl, rw/2, RTH-14-pl.length*12, 8, '#ffe14a', 'center', rw); }
     }
+    if(ui.toast) textBlock(g,[ui.toast], rw/2, RTH*.46, 9, '#ff8a6a', 'center', rw);
     if(net.dead) textBlock(g,['THE HOST LEFT.','[ENTER] BACK TO MENU'], rw/2, RTH*.4, 12, '#ff8a6a', 'center', rw);
   }
   hudL.tx.dispose(); hudL.tx.needsUpdate = true;
@@ -605,7 +610,7 @@ function loopStop(h){ if(!h) return; h.g.gain.setTargetAtTime(0, ac.currentTime,
 
 /* cook hum: plays the whole file once (start-up included), then loops its tail as overlapping
    copies that each fade in and out, so it runs as long as the cook does. */
-let humRun=null, turntable=null;
+let humRun=null, turntable=null, alarmSrc=null;
 function humStart(){
   const b = sfxBuf.mw_hum; if(!ac || !b) return false;
   const L=b.duration, seg=Math.min(L*.6,4), xf=Math.min(.6,seg/3), t0=ac.currentTime+.01;
@@ -628,7 +633,16 @@ function humStop(){
   clearInterval(humRun.timer); humRun.master.gain.setTargetAtTime(0, ac.currentTime, .06); humRun=null;
 }
 function cookStart(){ if(!humStart()) hum_synth=true; turntable=loopStart('mw_turntable',.5); }
-function cookStop(){ humStop(); hum_synth=false; loopStop(turntable); turntable=null; }
+/* the alarm is its own clip so it can be cut off the instant you open the door */
+function playAlarm(){
+  if(!ac) return; const b=sfxBuf.mw_alarm||sfxBuf.mw_end; if(!b) return;
+  stopAlarm(); const s=ac.createBufferSource(), g=ac.createGain(); s.buffer=b; s.connect(g).connect(ac.destination); s.start(); alarmSrc={s,g};
+}
+function stopAlarm(){
+  if(!alarmSrc) return; const {s,g}=alarmSrc; alarmSrc=null;
+  try{ g.gain.setTargetAtTime(0, ac.currentTime, .03); s.stop(ac.currentTime+.2); }catch(e){}
+}
+function cookStop(){ stopAlarm(); humStop(); hum_synth=false; loopStop(turntable); turntable=null; }
 let hum_synth=false;
 
 /* room tone: starts with the lights; synth brown-noise drone if the file is missing */
@@ -653,6 +667,37 @@ function thunk(f=90,dur=.12,vol=.35){
   o.frequency.setValueAtTime(f,ac.currentTime); o.frequency.exponentialRampToValueAtTime(f*.5,ac.currentTime+dur);
   g.gain.setValueAtTime(vol,ac.currentTime); g.gain.exponentialRampToValueAtTime(.001,ac.currentTime+dur);
   o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime+dur+.02);
+}
+
+/* door sounds: a latch click, a plastic clack, a hinge creak and the thunk against the stop */
+let noiseBuf=null;
+function noiseBurst(t, len, type, freq, q, vol, sweepTo){
+  if(!ac) return; if(!noiseBuf){ noiseBuf=ac.createBuffer(1,ac.sampleRate,ac.sampleRate); const d=noiseBuf.getChannelData(0); for(let i=0;i<d.length;i++) d[i]=Math.random()*2-1; }
+  const n=ac.createBufferSource(); n.buffer=noiseBuf; const f=ac.createBiquadFilter(); f.type=type; f.frequency.setValueAtTime(freq,t); f.Q.value=q;
+  if(sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo,t+len);
+  const g=ac.createGain(); g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(vol,t+.002); g.gain.exponentialRampToValueAtTime(.0005,t+len);
+  n.connect(f).connect(g).connect(ac.destination); n.start(t,Math.random()*.5); n.stop(t+len+.02);
+}
+function tone(t, f0, f1, len, vol, type='triangle'){
+  if(!ac) return; const o=ac.createOscillator(), g=ac.createGain(); o.type=type;
+  o.frequency.setValueAtTime(f0,t); o.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+len);
+  g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(.0005,t+len); o.connect(g).connect(ac.destination); o.start(t); o.stop(t+len+.02);
+}
+function doorOpenSynth(vol=1){
+  if(!ac) return; const t=ac.currentTime;
+  noiseBurst(t,        .02,  'bandpass', 3000, .9,  1.0*vol);              // latch release: the click
+  tone(t+.004,         1100, 380, .035, .32*vol, 'square');                  // plastic clack
+  noiseBurst(t+.03,    .16,  'bandpass', 700,  5,   .3*vol, 1300);        // hinge creak, rising
+  tone(t+.03,          240,  340, .16, .12*vol, 'sawtooth');
+  noiseBurst(t+.17,    .05,  'lowpass',  500,  .7,  .5*vol);               // door meets the stop
+  tone(t+.17,          120,  50,  .12, .5*vol, 'sine');                     // ...with a thunk
+}
+function doorCloseSynth(vol=1){
+  if(!ac) return; const t=ac.currentTime;
+  noiseBurst(t,        .05,  'lowpass',  600,  .7,  .5*vol);               // door swings shut
+  tone(t,              130,  50,  .13, .55*vol, 'sine');
+  noiseBurst(t+.05,    .014, 'bandpass', 2600, 1.6, .5*vol);               // latch catches
+  tone(t+.052,         900,  300, .03, .2*vol, 'square');
 }
 
 /* menu start sound: sub drop + rising noise + thunk, rendered by hand then bitcrushed
@@ -755,7 +800,7 @@ async function startMusic(){
       } catch(e){}
     }
   }
-  synthTechno();
+  if(musicMode==='legacy') legacySynth(); else synthTechno();
 }
 /* dark minimal techno, General Release-ish: hard saturated kick, offbeat hats, one clap, a rumble bass,
    a drone on a minor second (E/F), a lone stab, sidechain pumping, everything heard through a wall. */
@@ -820,6 +865,39 @@ function synthTechno(){
   setInterval(()=>{ while(next<ac.currentTime+.2){ T.step16(i,next); i++; next+=T.step; } },30);
 }
 
+/* the original track, kept as an option in Settings: 122bpm, offbeat bass, warm pad, no room */
+function legacySynth(){
+  const bpm=122, step=60/bpm/4;
+  const master=ac.createGain(); master.gain.value=.55;
+  const mlp=ac.createBiquadFilter(); mlp.type='lowpass'; mlp.frequency.value=3200;
+  master.connect(mlp).connect(ac.destination); mkAnalyser(mlp); beatSource='synth';
+  const nb=ac.createBuffer(1,ac.sampleRate,ac.sampleRate), nd=nb.getChannelData(0);
+  for(let i=0;i<nd.length;i++) nd[i]=Math.random()*2-1;
+  /* pad */
+  const pl=ac.createBiquadFilter(); pl.type='lowpass'; pl.frequency.value=500; pl.Q.value=4;
+  const pg=ac.createGain(); pg.gain.value=.07; pl.connect(pg).connect(master);
+  [110,130.8,164.8].forEach((f,i)=>[-6,6].forEach(d=>{ const o=ac.createOscillator(); o.type='sawtooth'; o.frequency.value=f; o.detune.value=d; o.connect(pl); o.start(); }));
+  const lfo=ac.createOscillator(), lg=ac.createGain(); lfo.frequency.value=.07; lg.gain.value=220; lfo.connect(lg).connect(pl.frequency); lfo.start();
+  const roots=[55,55,58.27,49];
+  function kick(t){ kickQueue.push(t); const o=ac.createOscillator(), g=ac.createGain(); o.frequency.setValueAtTime(150,t); o.frequency.exponentialRampToValueAtTime(42,t+.12);
+    g.gain.setValueAtTime(.95,t); g.gain.exponentialRampToValueAtTime(.001,t+.4); o.connect(g).connect(master); o.start(t); o.stop(t+.45); }
+  function hat(t,v,len){ const s=ac.createBufferSource(); s.buffer=nb; const hp=ac.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=7500;
+    const g=ac.createGain(); g.gain.setValueAtTime(v,t); g.gain.exponentialRampToValueAtTime(.001,t+len); s.connect(hp).connect(g).connect(master); s.start(t); s.stop(t+len+.02); }
+  function bass(t,f){ const o=ac.createOscillator(), lp=ac.createBiquadFilter(), g=ac.createGain(); o.type='sawtooth'; o.frequency.value=f;
+    lp.type='lowpass'; lp.frequency.setValueAtTime(420,t); lp.frequency.exponentialRampToValueAtTime(90,t+.22);
+    g.gain.setValueAtTime(.3,t); g.gain.exponentialRampToValueAtTime(.001,t+.26); o.connect(lp).connect(g).connect(master); o.start(t); o.stop(t+.3); }
+  let i=0, next=ac.currentTime+.1;
+  setInterval(()=>{
+    while(next<ac.currentTime+.2){
+      const s=i%16, bar=Math.floor(i/16)%4;
+      if(s%4===0) kick(next);
+      if(s%4===2){ hat(next,.16,.12); bass(next,roots[bar]); }
+      else if(s%2===1) hat(next,.05,.04);
+      i++; next+=step;
+    }
+  },30);
+}
+
 /* ---------- game ---------- */
 const fmt = s => Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0');
 const PRESETS = {1:15, 2:30, 3:45, 4:60, 5:107, 6:300};
@@ -834,11 +912,12 @@ function remaining(now){ return Math.max(0, dur - (now-startT)/1000); }
 /* no UI while cooking: text only shows before a run (start hint) and after it (result) */
 function setPrompt(){
   if(mp) ui.prompt = '';
+  else if(state==='idle' && randomTime) ui.prompt = '[F] START\nTHE TIMER IS RANDOM\n[ESC] MENU';
   else if(state==='idle'){
     const it = k => `${PRESETS[k]===preset?'*':' '}[${k}] ${fmt(PRESETS[k])}`;
-    ui.prompt = `[F] START   [<] [>] TIME\n${['1','2','3','4'].map(it).join(' ')}\n${['5','6'].map(it).join(' ')}`;
+    ui.prompt = `[F] START   [<] [>] TIME\n${['1','2','3','4'].map(it).join(' ')}\n${['5','6'].map(it).join(' ')}\n[ESC] MENU`;
   }
-  else if(state==='result') ui.prompt = '[R] REHEAT SOMETHING ELSE';
+  else if(state==='result') ui.prompt = '[R] REHEAT SOMETHING ELSE    [ESC] MENU';
   else ui.prompt = '';
 }
 function setStat(){
@@ -850,7 +929,8 @@ function applyPts(p){            // solo only: online scores are kept by the hos
 }
 function startRun(forceDur){
   if(state!=='idle' || !started) return;
-  dur = forceDur || preset; startT = performance.now(); state='running'; stared=0;
+  dur = forceDur || (randomTime ? 15 + Math.floor(Math.random()*166) : preset);   // solo random: 15 s to 3 min
+  startT = performance.now(); state='running'; stared=0;
   ui.msg='';
   if(!sfxBuf.mw_hum) sfx('mw_start',1,()=>{ thunk(110,.1,.4); beep(1800,.08,.08); }); // the real start-up is the head of mw_hum
   cookStart();
@@ -976,7 +1056,7 @@ function pick(cat, args){
 }
 function finish(leftDisp, rem, wasDone){
   state='result'; mws[me].doorTarget=1; cookStop();
-  if(!(wasDone && sfxBuf.mw_end)) sfx('mw_door_open',1,()=>thunk(70,.2,.45)); // after the alarm, the door sound is inside mw_end
+  sfx('mw_door_open',1,()=>doorOpenSynth());                          // always on the real open (your own sfx/mw_door_open.* wins)
   if(!mp){ stats.runs++; stats.stared += Math.round(stared); }
   let pts, m;
   if(wasDone){ pts = END_PENALTY; emitEv('door',0,0); }          // the -5 was applied when the timer hit zero
@@ -990,7 +1070,7 @@ function finish(leftDisp, rem, wasDone){
     else if(elapsed>.75) m = pick('almost', {left:leftDisp});
     else m = pick('early', {left:leftDisp});
   } else {
-    const per = sfxBuf.mw_end ? 4 : sfxBuf.mw_ding ? 3 : 1;
+    const per = (sfxBuf.mw_alarm||sfxBuf.mw_end) ? 4 : sfxBuf.mw_ding ? 3 : 1;
     const n = beeps*per;
     if(beeps<=1) m = pick('quick', {n});
     else if(beeps<=3) m = pick('late', {n});
@@ -1002,7 +1082,7 @@ function finish(leftDisp, rem, wasDone){
 }
 function reset(){
   if(state!=='result' || mp) return;
-  mws[me].doorTarget=0; state='idle'; ui.msg=''; sfx('mw_door_close',1,()=>thunk(80,.18,.4));
+  mws[me].doorTarget=0; state='idle'; ui.msg=''; sfx('mw_door_close',1,()=>doorCloseSynth());
   spinner.rotation.y=0; setPrompt();
 }
 
@@ -1099,7 +1179,7 @@ function hostBook(m){
 function onEvVisual(m){
   const i = net.order.indexOf(m.pid); if(i<0 || i===me || !mws[i]) return;
   const mw = mws[i];
-  if(m.k==='open' || m.k==='door'){ mw.rs.phase='opened'; mw.doorTarget=1; thunk(70,.15,.12); }
+  if(m.k==='open' || m.k==='door'){ mw.rs.phase='opened'; mw.doorTarget=1; sfx('mw_door_open',.3,()=>doorOpenSynth(.3)); }
   else if(m.k==='end' && mw.rs.phase!=='opened'){ mw.rs.phase='ended'; }
 }
 function markGone(pid){
@@ -1179,9 +1259,17 @@ idbGet('music').then(rec=>{ if(rec) customInfo = { name:rec.name, bpm:0 }; if(re
 function settingsAction(k){
   if(k==='u') fileIn.click();
   else if(k==='c' && customInfo){ idbDel('music').catch(()=>{}); customInfo=null; settingsMsg='BACK TO THE BUILT-IN TRACK'; }
+  else if(k==='t'){ randomTime=!randomTime; try{ localStorage.setItem('mw-random-time', randomTime?'on':'off'); }catch(e){} settingsMsg = randomTime ? 'SOLO TIMER IS RANDOM' : 'SOLO: YOU PICK THE TIME'; setPrompt(); }
+  else if(k==='l'){ musicMode = musicMode==='legacy' ? 'new' : 'legacy'; try{ localStorage.setItem('mw-music-mode', musicMode); }catch(e){} settingsMsg = musicMode==='legacy' ? 'LEGACY SYNTH. PLAYS NEXT GAME.' : 'NEW SYNTH. PLAYS NEXT GAME.'; }
 }
 
 /* ---------- input ---------- */
+let escUntil=0, toastT=null;
+function leaveToMenu(){               // back to the main menu (a reload: clean state, music and room dropped)
+  const now = performance.now();
+  if(mp && now>escUntil){ escUntil=now+2500; ui.toast='PRESS ESC AGAIN TO LEAVE THE MATCH'; clearTimeout(toastT); toastT=setTimeout(()=>{ ui.toast=''; },2500); return; }
+  location.reload();
+}
 function menuAction(k){
   if(k==='p') startSolo();
   else if(k==='h') hostRoom();
@@ -1210,6 +1298,7 @@ function menuKey(e, k){
 addEventListener('keydown', e=>{
   const k = e.key.toLowerCase();
   if(phase==='menu'){ if(ac) ac.resume().then(menuAmbStart); menuKey(e,k); return; }
+  if(k==='escape'){ e.preventDefault(); leaveToMenu(); return; }
   if(!started) return;
   if(mp){
     if(k==='e' || k===' '){ e.preventDefault(); openDoor(); }
@@ -1219,7 +1308,7 @@ addEventListener('keydown', e=>{
   if(k==='f'||k==='enter') startRun();
   else if(k==='e'||k===' ') { e.preventDefault(); openDoor(); }
   else if(k==='r') reset();
-  else if(state==='idle' && (PRESETS[k] || k==='arrowleft' || k==='arrowright' || k==='a' || k==='d')){
+  else if(state==='idle' && !randomTime && (PRESETS[k] || k==='arrowleft' || k==='arrowright' || k==='a' || k==='d')){
     if(PRESETS[k]) preset=PRESETS[k];
     else { const i=PRESET_KEYS.findIndex(q=>PRESETS[q]===preset), n=PRESET_KEYS.length, dir=(k==='arrowleft'||k==='a')?-1:1;
            preset=PRESETS[PRESET_KEYS[(i+dir+n)%n]]; }
@@ -1333,12 +1422,12 @@ function frame(now){
     drawDisplay('0:00', Math.floor(t*2)%2===0, L);
     if(now>=nextBeep){
       beeps++;
-      if(sfxBuf.mw_end){ sfx('mw_end',1); nextBeep=now+8000; }
+      if(sfxBuf.mw_alarm || sfxBuf.mw_end){ playAlarm(); nextBeep=now+8000; }
       else if(sfxBuf.mw_ding){ [0,850,1700].forEach(d=>setTimeout(()=>sfx('mw_ding',.9),d)); nextBeep=now+5200; }
       else { beep(2300,.14,.12); setTimeout(()=>beep(2300,.14,.12),220); setTimeout(()=>beep(2300,.14,.12),440); nextBeep=now+3200; }
     }
   } else if(state==='idle'){
-    drawDisplay(mp ? '--:--' : fmt(preset), true, L);
+    drawDisplay((mp || randomTime) ? '--:--' : fmt(preset), true, L);
   } else {
     drawDisplay('--:--', Math.floor(t*1.5)%2===0, L);
   }
@@ -1401,9 +1490,13 @@ function frame(now){
   /* camera: sway and parallax; pulls back to fit every player's microwave */
   /* pull back until the whole row of microwaves fits the window, whatever its shape */
   const fitZ = mws.length>1 ? ((mws.length-1)*.62+.95) / (2*Math.tan(cam.fov*Math.PI/360)*cam.aspect) : 0;
-  const camZ = Math.max(camBaseZ, fitZ) - (mp ? 0 : .04*progressSmooth);
-  cam.position.set(mx*.06 + Math.sin(t*.31)*.008, 1.14 + Math.sin(t*.47)*.005 - my*.02, camZ);
-  cam.lookAt(.02 + mx*.03, 1.08 - my*.015, 0);
+  const camZ = Math.max(camBaseZ, fitZ) * (1 - (mp ? .05 : .13)*progressSmooth);      // creeps in as the timer runs down
+  /* idle: a slow breath (about 6s), a very slow drift, and a faint tilt rocking left to right */
+  const TAU=Math.PI*2, breath=Math.sin(t*TAU/6.2)+.3*Math.sin(t*TAU/3.1+.8);
+  const drift=Math.sin(t*TAU/23), roll=Math.sin(t*TAU/17)*.014 + Math.sin(t*TAU/9.3+1.2)*.004;
+  cam.position.set(mx*.06 + drift*.02, 1.14 + breath*.006 - my*.02, camZ + breath*.005);
+  cam.lookAt(.02 + mx*.03 + drift*.015, 1.08 - my*.015 + breath*.003, 0);
+  cam.rotateZ(roll);
 
   postMat.uniforms.time.value = t;
   postMat.uniforms.mA.value = phase==='menu' ? 1 : phase==='dissolve' ? Math.max(0,1-(now-dissolveAt)/1000) : 0;
