@@ -16,6 +16,9 @@
 (() => {
 'use strict';
 const QUIET = /[?&]quiet/.test(location.search);   // dev: no audio, auto-start
+/* the opening (gate -> logo -> black -> menu) plays on a fresh visit; dev flags and "back to menu" skip it */
+const SKIP_INTRO = (QUIET && !/[?&]introtest/.test(location.search)) || /[?&]skipintro/.test(location.search)
+  || (()=>{ try{ const v=sessionStorage.getItem('mw-skipintro'); sessionStorage.removeItem('mw-skipintro'); return v==='1'; }catch(e){ return false; } })();
 if(QUIET){ window.AudioContext=undefined; window.webkitAudioContext=undefined; }
 
 /* ---------- renderer: tiny render target, chunky post pass ---------- */
@@ -182,6 +185,14 @@ const dust = Array.from({length:44},()=>({x:Math.random(),y:Math.random(),vx:(Ma
 let glitch = 0;
 function drawMenu(rw, t){
   const g = menuL.g;
+  if(phase==='gate' || phase==='logo' || phase==='pre'){           // the opening: pure black, with only what belongs there
+    g.fillStyle='#000'; g.fillRect(0,0,rw,RTH);
+    if(phase==='gate'){
+      textBlock(g,['HEADPHONES. DARK ROOM.'], rw/2, RTH*.46, 7, '#6a5a40', 'center', rw, false);
+      textBlock(g,[Math.floor(t*1.4)%2===0 ? '[ CLICK TO BEGIN ]' : ' '], rw/2, RTH*.54, 8, '#a08a60', 'center', rw, false);
+    } else if(phase==='logo' && logoA>0) drawDreadLogo(g, rw/2, RTH*.42, 16*RTH/300, Math.round(logoA*20)/20);   // alpha in steps, so the fade steps through the palette and dither
+    menuL.tx.needsUpdate = true; return;
+  }
   if(leaving){ g.fillStyle='#000'; g.fillRect(0,0,rw,RTH); menuL.tx.needsUpdate = true; return; }   // leaving the game: the dissolve covers it with black
   g.fillStyle='#050403'; g.fillRect(0,0,rw,RTH);
   const fk = fl;
@@ -1491,18 +1502,19 @@ function settingsAction(k){
 
 /* ---------- input ---------- */
 let escUntil=0, toastT=null;
+function reloadToMenu(){ try{ sessionStorage.setItem('mw-skipintro','1'); }catch(e){} window.location.reload(); }
 function showToast(text, ms=3000){ ui.toast=text; clearTimeout(toastT); toastT=setTimeout(()=>{ ui.toast=''; }, ms); }
 function leaveToMenu(){               // back to the main menu (a reload: clean state, music and room dropped)
   const now = performance.now();
   if(mp && now>escUntil){ escUntil=now+2500; showToast('PRESS ESC AGAIN TO LEAVE THE MATCH', 2500); return; }
   sendBye();
-  if(phase!=='live'){ location.reload(); return; }              // still in the intro: nothing to dissolve
+  if(phase!=='live'){ reloadToMenu(); return; }              // still in the intro: nothing to dissolve
   if(phase==='leaving') return;
   phase='leaving'; leaving=true; leavingAt=performance.now();
   if(ac && masterIn){ masterIn.gain.cancelScheduledValues(ac.currentTime); masterIn.gain.setValueAtTime(0, ac.currentTime); }   // music, room tone, everything cuts the instant the leave sound starts
   useDry=true; try{ menuSfx(); } finally{ useDry=false; }          // the same bitcrushed drop as pressing play, on the dry route so it isn't muted
   setTimeout(()=>{ try{ if(ac) ac.suspend(); }catch(e){} }, 1450);   // everything goes silent once it's black
-  setTimeout(()=>location.reload(), 2700);                         // ...then the menu pops up
+  setTimeout(()=>reloadToMenu(), 2700);                         // ...then the menu pops up
 }
 function menuAction(k){
   if(k==='p') startSolo();
@@ -1539,6 +1551,8 @@ addEventListener('keydown', e=>{
   /* keys the browser would otherwise act on (Backspace = back / close tab in some browsers, Delete, Tab, arrows scrolling):
      the game owns them, so stop the page from seeing them */
   if(k==='backspace' || k==='delete' || k==='tab' || k===' ' || k.startsWith('arrow')) e.preventDefault();
+  if(phase==='gate'){ if(k!=='tab' && k!=='escape') onGateClick(); return; }
+  if(phase==='logo' || phase==='pre') return;
   if(phase==='leaving') return;
   if(phase==='menu'){
     if(ac) ac.resume().then(menuAmbStart);
@@ -1556,7 +1570,7 @@ addEventListener('keydown', e=>{
   if(!started) return;
   if(mp){
     if(k==='e' || k===' '){ e.preventDefault(); openDoor(); }
-    else if(k==='enter' && ((ui.board && ui.board.final) || net.dead)) location.reload();
+    else if(k==='enter' && ((ui.board && ui.board.final) || net.dead)) reloadToMenu();
     return;
   }
   if(k==='f'||k==='enter') startRun();
@@ -1570,6 +1584,8 @@ addEventListener('keydown', e=>{
   }
 });
 addEventListener('pointerdown', e=>{
+  if(phase==='gate'){ onGateClick(); return; }
+  if(phase==='logo' || phase==='pre') return;
   if(phase==='leaving') return;
   if(phase==='menu'){
     const y = e.clientY/innerHeight*RTH;
@@ -1581,7 +1597,7 @@ addEventListener('pointerdown', e=>{
   }
   if(!started) return;
   if(mp){
-    if((ui.board && ui.board.final) || net.dead) location.reload();
+    if((ui.board && ui.board.final) || net.dead) reloadToMenu();
     else openDoor();
     return;
   }
@@ -1604,7 +1620,57 @@ addEventListener('pagehide', sendBye);
 addEventListener('beforeunload', ()=>{ sendBye(); try{ net.peer && net.peer.destroy(); }catch(e){} });
 
 /* menu -> dissolve (1s) -> black (4s) -> lights, buzz and music slam in */
-let live=false, liveAt=0, phase='menu', dissolveAt=0, leaving=false, leavingAt=0;
+let live=false, liveAt=0, phase=SKIP_INTRO ? 'menu' : 'gate', dissolveAt=0, leaving=false, leavingAt=0;
+/* THE OPENING: gate (black, one click) -> logo fades in over low ambience -> far-off sound -> logo fades out -> ~5 s of pure black -> hard cut to the menu */
+let introStart=0, introT=0, logoA=0;
+const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+function drawDreadLogo(g, cx, cy, r, alpha = 1){       // an eye: solid on the left, dissolving into Bayer dither to the right, a pupil, a glint, then the wordmark
+  cx = Math.round(cx); cy = Math.round(cy); r = Math.round(r);
+  g.globalAlpha = alpha; g.fillStyle = '#e6d6a6';
+  const px = -r * .25, pr = r * .3;
+  for(let y = -r; y <= r; y++) for(let x = -r; x <= r; x++){
+    const d = Math.hypot(x, y); if(d > r) continue;
+    if(Math.hypot(x - px, y) < pr) continue;
+    const solid = 1 - (x + r) / (2 * r);
+    if(d > r - 1.2 || solid * 1.15 > BAYER4[((y & 3) << 2) | (x & 3)] / 16) g.fillRect(cx + x, cy + y, 1, 1);
+  }
+  g.fillRect(cx + Math.round(px) + 1, cy - 2, 1, 1);
+  const ws = Math.max(6, Math.round(r * .62));
+  g.font = 'bold ' + ws + 'px ui-monospace,"Courier New",monospace'; g.textAlign = 'center'; g.textBaseline = 'top';
+  try{ g.letterSpacing = Math.round(ws / 2) + 'px'; }catch(e){}
+  g.fillText('DITHERED DREAD', cx, cy + r + ws);
+  try{ g.letterSpacing = '0px'; }catch(e){}
+  g.globalAlpha = 1; g.textAlign = 'left';
+}
+function onGateClick(){                                   // browsers need a gesture before audio: this click is the only thing the player does
+  if(phase!=='gate') return;
+  if(ac) ac.resume().catch(()=>{});
+  introSound(); phase='logo'; introStart=performance.now(); introT=0;
+}
+function introTick(now){                                  // timeline, driven by the wall clock so throttled frames can't stretch it
+  if(phase!=='logo' && phase!=='pre') return;
+  introT=(now-introStart)/1000;
+  logoA = introT<.8 ? 0 : introT<3.3 ? (introT-.8)/2.5 : introT<4.9 ? 1 : introT<7.1 ? 1-(introT-4.9)/2.2 : 0;
+  if(introT>=7.1 && phase==='logo') phase='pre';          // ~5 s of black
+  if(introT>=12.1) introToMenu();
+}
+function introToMenu(){                                   // no fade: the room is simply there, with a thud
+  phase='menu';
+  if(ac){ tone(ac.currentTime, 58, 36, .55, .5, 'sine'); noiseBurst(ac.currentTime, .05, 'lowpass', 1100, .7, .22); }
+  menuAmbStart();                                         // the room tone snaps on with it
+}
+function introSound(){                                    // all scheduled now, relative to the click; nothing high-pitched
+  if(!ac) return; const T=ac.currentTime;
+  [55,58.3].forEach(f=>{                                  // two low saws a minor second apart, swelling with the logo
+    const o=ac.createOscillator(), l=ac.createBiquadFilter(), g=ac.createGain(); o.type='sawtooth'; o.frequency.value=f;
+    l.type='lowpass'; l.frequency.value=160; l.Q.value=2;
+    g.gain.setValueAtTime(0,T+.8); g.gain.linearRampToValueAtTime(.07,T+4); g.gain.linearRampToValueAtTime(.09,T+6); g.gain.linearRampToValueAtTime(0,T+8.5);
+    o.connect(l).connect(g).connect(DEST()); o.start(T); o.stop(T+9);
+  });
+  noiseBurst(T+1.0, 5.6, 'bandpass', 200, 1.2, .16, 900);                // a brown-ish noise swell, rising 200 -> 900 Hz, gone as the logo leaves
+  noiseBurst(T+4.1, .04, 'lowpass', 900, .7, .10); tone(T+4.1, 62, 38, .5, .22, 'sine');   // one far-off click and thunk, as if from another room
+  noiseBurst(T+10.0, .4, 'bandpass', 500, 6, .05, 900);                  // one faint creak in the black
+}
 function startSolo(){ mp=null; buildLayout(1,0); setPrompt(); setStat(); play(); }
 function play(){
   if(phase!=='menu') return;
@@ -1660,7 +1726,7 @@ audioInit(); if(ac) ac.onstatechange=()=>menuAmbStart(); menuAmbStart();
 if(QUIET){
   window.__mw = { net, mws, get mp(){return mp}, get state(){return state}, get phase(){return phase}, get menuView(){return menuView},
     get netStatus(){return netStatus}, key:k=>dispatchEvent(new KeyboardEvent('keydown',{key:k})), hostRoom, joinRoom, hostStart, buildTechno, analyseTempo, fileIn, get customInfo(){return customInfo}, get settingsMsg(){return settingsMsg}, get ui(){return ui}, get typing(){return typing}, typeTick };
-  if(!/[?&]menu/.test(location.search)) startSolo();
+  if(!/[?&]menu/.test(location.search) && phase==='menu') startSolo();
 }
 
 /* ---------- loop ---------- */
@@ -1779,9 +1845,10 @@ function frame(now){
   }
 
   postMat.uniforms.time.value = t;
-  postMat.uniforms.mA.value = phase==='menu' ? 1 : phase==='dissolve' ? Math.max(0,1-(now-dissolveAt)/1000) : phase==='leaving' ? Math.min(1,(now-leavingAt)/1000) : 0;
+  postMat.uniforms.mA.value = (phase==='menu' || phase==='gate' || phase==='logo' || phase==='pre') ? 1 : phase==='dissolve' ? Math.max(0,1-(now-dissolveAt)/1000) : phase==='leaving' ? Math.min(1,(now-leavingAt)/1000) : 0;
   postMat.uniforms.blk.value = (phase==='live' || phase==='leaving') ? 0 : 1;
-  if(phase==='menu'||phase==='dissolve'||phase==='leaving') drawMenu(rt.width, t);
+  introTick(now);
+  if(phase==='menu'||phase==='dissolve'||phase==='leaving'||phase==='gate'||phase==='logo'||phase==='pre') drawMenu(rt.width, t);
   drawHud(rt.width);
   renderer.setRenderTarget(rt); renderer.render(scene, cam);
   renderer.setRenderTarget(null); renderer.render(post, postCam);

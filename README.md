@@ -4,6 +4,8 @@ A browser game about staring at a microwave and deciding when to open the door. 
 
 **Also here:** [Sump Clerk](sump-clerk/), a one-room night-shift horror game about keeping three needles in the green until 06:00. Play it at [/sump-clerk/](https://notarqen.github.io/microwave-staring-sim/sump-clerk/).
 
+**Opening:** a black screen with one click (browsers need a click before they will play sound), then the Dithered Dread logo fades in over low ambience and fades out, about five seconds of pure black, and the menu hard-cuts in. Going back to the menu from inside the game skips it. Add `?skipintro` to the address to skip it yourself.
+
 Open `index.html` in a browser, or play it on GitHub Pages. `I` on the menu shows the rules, `S` opens settings, `Esc` goes back to the menu from anywhere.
 
 **Solo:** the timer is a random 0:15 to 3:00 each run. Turn that off in **Settings** to pick your own (`1`-`6` or the arrow keys).
